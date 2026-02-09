@@ -100,7 +100,8 @@ step_export() {
 # ============================================================
 phase_initial_access() {
     log "\n  ${MAG}── Phase 1: Initial Access${NC}"
-    local rpt="$OUTDIR/phases/01_initial_access.txt"; local h=0
+    local rpt="$OUTDIR/phases/01_initial_access.txt"
+    local hc="$OUTDIR/raw/_cnt_01_initial_access.txt"; echo 0 > "$hc"
     echo "PHASE 1: INITIAL ACCESS — How did the attacker get in?" > "$rpt"
     for xf in "$OUTDIR/xml_exports/"*.xml; do [ -f "$xf" ] || continue; local fn=$(basename "$xf")
         # EID 4624: Logon — focus on Type 3(network),10(RDP),8(cleartext)
@@ -116,24 +117,24 @@ phase_initial_access() {
                 10) tl "$_TS" "HIGH" "Initial Access" "T1021.001 RDP" "$fn" "RDP logon(10): ${d}\\${u} from ${ip} [4624]"
                     crit "RDP logon: ${d}\\${u} from ${ip}" ;;
                 8)  tl "$_TS" "HIGH" "Initial Access" "T1078 Valid Accounts" "$fn" "Cleartext logon(8): ${d}\\${u} from ${ip} [4624]" ;;
-            esac; h=$((h+1))
+            esac; echo x >> "$hc"
         done
         # EID 4625: Failed logons (brute force)
-        local fc=$(grep -c '>4625<' "$xf" 2>/dev/null || echo 0)
+        local fc; fc=$(grep -c '>4625<' "$xf" 2>/dev/null || true); fc="${fc//[^0-9]/}"; fc="${fc:-0}"
         if [ "$fc" -gt 10 ]; then
             local fl=$(grep -n '>4625<' "$xf" | head -1 | cut -d: -f1)
             [ -n "$fl" ] && ectx "$xf" "$fl"
             tl "$_TS" "HIGH" "Initial Access" "T1110 Brute Force" "$fn" "${fc} failed logons [4625]"
-            warn "Brute force: $fc failures in $fn"; h=$((h+1))
+            warn "Brute force: $fc failures in $fn"; echo x >> "$hc"
         fi
         # EID 4648: Explicit credentials
         grep -n '>4648<' "$xf" 2>/dev/null | while IFS=: read -r ln _; do
             ectx "$xf" "$ln"
             local blk=$(sed -n "$((ln)),$((ln+30))p" "$xf" 2>/dev/null)
             local ts=$(echo "$blk" | grep -oP 'TargetServerName">\K[^<]+' 2>/dev/null | head -1)
-            tl "$_TS" "MEDIUM" "Initial Access" "T1078 Valid Accounts" "$fn" "Explicit creds: $_USER → $ts [4648]"; h=$((h+1))
+            tl "$_TS" "MEDIUM" "Initial Access" "T1078 Valid Accounts" "$fn" "Explicit creds: $_USER → $ts [4648]"; echo x >> "$hc"
         done
-    done; info "Initial Access: $h events"
+    done; local hv; hv=$(wc -l < "$hc" 2>/dev/null || true); hv="${hv//[^0-9]/}"; hv="${hv:-0}"; info "Initial Access: $hv events"
 }
 
 # ============================================================
@@ -141,7 +142,8 @@ phase_initial_access() {
 # ============================================================
 phase_execution() {
     log "\n  ${MAG}── Phase 2: Execution${NC}"
-    local rpt="$OUTDIR/phases/02_execution.txt"; local h=0
+    local rpt="$OUTDIR/phases/02_execution.txt"
+    local hc="$OUTDIR/raw/_cnt_02_execution.txt"; echo 0 > "$hc"
     echo "PHASE 2: EXECUTION — What did the attacker run?" > "$rpt"
     for xf in "$OUTDIR/xml_exports/"*.xml; do [ -f "$xf" ] || continue; local fn=$(basename "$xf")
         # EID 4104: PowerShell ScriptBlock — THE KEY EVENT
@@ -159,7 +161,7 @@ phase_execution() {
             echo "$sc" | grep -qiE "[Nn]ova|beacon|payload|stager|implant|callbackURI" && { sev="CRITICAL"; tech="T1059.001 PS+Nova/C2"; }
             echo "$sc" | grep -qiE "Invoke-Expression|IEX" && [ "$sev" = "MEDIUM" ] && sev="HIGH"
             tl "$_TS" "$sev" "Execution" "$tech" "$fn" "ScriptBlock[4104]: $(echo "$sc" | cut -c1-350)"
-            echo "[$_TS][$sev] $sc" >> "$rpt"; h=$((h+1))
+            echo "[$_TS][$sev] $sc" >> "$rpt"; echo x >> "$hc"
         done
         # EID 4688: Process Creation
         grep -n '>4688<' "$xf" 2>/dev/null | while IFS=: read -r ln _; do
@@ -175,7 +177,7 @@ phase_execution() {
             echo "$np" | grep -qiE "\\\\temp\\\\|\\\\tmp\\\\|\\\\appdata\\\\" && [ "$sev" = "INFO" ] && { sev="HIGH"; tech="T1204 User Execution"; }
             [ "$sev" != "INFO" ] && {
                 tl "$_TS" "$sev" "Execution" "$tech" "$fn" "Proc[4688]: $np | Cmd:$(echo "$cl" | cut -c1-200) | Parent:$pp"
-                echo "[$_TS][$sev] $np | $cl" >> "$rpt"; h=$((h+1))
+                echo "[$_TS][$sev] $np | $cl" >> "$rpt"; echo x >> "$hc"
             }
         done
         # EID 4103: PowerShell Module + EID 800: Pipeline
@@ -185,7 +187,7 @@ phase_execution() {
             if echo "$blk" | grep -qiE "MpPreference|Invoke-|Download|EncodedCommand|nova|beacon|base64"; then
                 local det=$(echo "$blk" | grep -iE "MpPreference|Invoke-|Download|EncodedCommand|nova|beacon|base64" | head -1 | sed 's/^[[:space:]]*//' | cut -c1-300)
                 tl "$_TS" "HIGH" "Execution" "T1059.001 PowerShell" "$fn" "Module/Pipeline[$_EID]: $det"
-                echo "[$_TS] $det" >> "$rpt"; h=$((h+1))
+                echo "[$_TS] $det" >> "$rpt"; echo x >> "$hc"
             fi
         done
         # Sysmon EID 1: Process Creation
@@ -197,10 +199,10 @@ phase_execution() {
             local pi=$(echo "$blk" | grep -oP 'ParentImage">\K[^<]+' 2>/dev/null | head -1)
             if echo "$img$cl" | grep -qiE "powershell|cmd\.exe|certutil|bitsadmin|mshta|regsvr32|rundll32|nova|beacon|\\\\temp\\\\"; then
                 tl "$_TS" "HIGH" "Execution" "T1059 Scripting" "$fn" "Sysmon[1]: $img | $(echo "$cl" | cut -c1-200) | parent:$pi"
-                echo "[$_TS] Sysmon: $img | $cl" >> "$rpt"; h=$((h+1))
+                echo "[$_TS] Sysmon: $img | $cl" >> "$rpt"; echo x >> "$hc"
             fi
         done
-    done; info "Execution: $h events"
+    done; local hv; hv=$(wc -l < "$hc" 2>/dev/null || true); hv="${hv//[^0-9]/}"; hv="${hv:-0}"; info "Execution: $hv events"
 }
 
 # ============================================================
@@ -208,7 +210,8 @@ phase_execution() {
 # ============================================================
 phase_persistence() {
     log "\n  ${MAG}── Phase 3: Persistence${NC}"
-    local rpt="$OUTDIR/phases/03_persistence.txt"; local h=0
+    local rpt="$OUTDIR/phases/03_persistence.txt"
+    local hc="$OUTDIR/raw/_cnt_03_persistence.txt"; echo 0 > "$hc"
     echo "PHASE 3: PERSISTENCE — How did they stay?" > "$rpt"
     for xf in "$OUTDIR/xml_exports/"*.xml; do [ -f "$xf" ] || continue; local fn=$(basename "$xf")
         # EID 7045: New Service
@@ -218,7 +221,7 @@ phase_persistence() {
             local sp=$(echo "$blk" | grep -oP 'ImagePath">\K[^<]+' 2>/dev/null | head -1)
             local sev="MEDIUM"; echo "$sp" | grep -qiE "powershell|cmd|temp\\\\|tmp\\\\|nova|beacon|payload" && { sev="CRITICAL"; crit "Suspicious svc: $sn → $sp"; }
             tl "$_TS" "$sev" "Persistence" "T1543.003 Windows Service" "$fn" "New svc: $sn | $sp [7045]"
-            echo "[$_TS][$sev] Svc: $sn → $sp" >> "$rpt"; h=$((h+1))
+            echo "[$_TS][$sev] Svc: $sn → $sp" >> "$rpt"; echo x >> "$hc"
         done
         # EID 4698: Scheduled Task Created
         grep -n '>4698<' "$xf" 2>/dev/null | while IFS=: read -r ln _; do
@@ -226,25 +229,25 @@ phase_persistence() {
             local tn=$(echo "$blk" | grep -oP 'TaskName">\K[^<]+' 2>/dev/null | head -1)
             local sev="MEDIUM"; echo "$tn" | grep -qiE "nova|beacon|payload|update.*check|sync.*task" && { sev="CRITICAL"; crit "Suspicious task: $tn"; }
             tl "$_TS" "$sev" "Persistence" "T1053.005 Scheduled Task" "$fn" "Task created: $tn [4698]"
-            echo "[$_TS] Task: $tn" >> "$rpt"; h=$((h+1))
+            echo "[$_TS] Task: $tn" >> "$rpt"; echo x >> "$hc"
         done
         # Registry Run keys
         grep -n -iE 'HKLM.*\\Run|HKCU.*\\Run|New-ItemProperty.*Run|CurrentVersion.*\\Run' "$xf" 2>/dev/null | head -50 | while IFS=: read -r ln _; do
             ectx "$xf" "$ln"; local ml=$(sed -n "${ln}p" "$xf" | sed 's/^[[:space:]]*//' | cut -c1-300)
             tl "$_TS" "CRITICAL" "Persistence" "T1547.001 Registry Run Keys" "$fn" "Run key: $ml [$_EID]"
-            crit "Run key persistence"; echo "[$_TS] Run key: $ml" >> "$rpt"; h=$((h+1))
+            crit "Run key persistence"; echo "[$_TS] Run key: $ml" >> "$rpt"; echo x >> "$hc"
         done
         # schtasks /create
         grep -n -iE 'schtasks.*/create' "$xf" 2>/dev/null | head -30 | while IFS=: read -r ln _; do
             ectx "$xf" "$ln"; local ml=$(sed -n "${ln}p" "$xf" | sed 's/^[[:space:]]*//' | cut -c1-300)
             tl "$_TS" "HIGH" "Persistence" "T1053.005 Scheduled Task" "$fn" "schtasks: $ml [$_EID]"
-            echo "[$_TS] schtasks: $ml" >> "$rpt"; h=$((h+1))
+            echo "[$_TS] schtasks: $ml" >> "$rpt"; echo x >> "$hc"
         done
         # WMI subscriptions
         grep -n -iE 'EventConsumer|EventFilter|FilterToConsumer|__EventSubscription|CommandLineEventConsumer' "$xf" 2>/dev/null | head -20 | while IFS=: read -r ln _; do
             ectx "$xf" "$ln"; local ml=$(sed -n "${ln}p" "$xf" | sed 's/^[[:space:]]*//' | cut -c1-300)
             tl "$_TS" "CRITICAL" "Persistence" "T1546.003 WMI Subscription" "$fn" "WMI persist: $ml [$_EID]"
-            crit "WMI persistence"; echo "[$_TS] WMI: $ml" >> "$rpt"; h=$((h+1))
+            crit "WMI persistence"; echo "[$_TS] WMI: $ml" >> "$rpt"; echo x >> "$hc"
         done
         # Sysmon 13: Registry Run keys
         grep -n '>13<' "$xf" 2>/dev/null | while IFS=: read -r ln _; do
@@ -254,10 +257,10 @@ phase_persistence() {
             echo "$to" | grep -qiE "\\\\Run\\\\|\\\\RunOnce\\\\|\\\\Startup" && {
                 local dt=$(echo "$blk" | grep -oP 'Details">\K[^<]+' 2>/dev/null | head -1)
                 tl "$_TS" "CRITICAL" "Persistence" "T1547.001 Registry Run" "$fn" "Sysmon Reg[13]: $to → $(echo "$dt" | cut -c1-200)"
-                echo "[$_TS] Reg: $to → $dt" >> "$rpt"; h=$((h+1))
+                echo "[$_TS] Reg: $to → $dt" >> "$rpt"; echo x >> "$hc"
             }
         done
-    done; info "Persistence: $h events"
+    done; local hv; hv=$(wc -l < "$hc" 2>/dev/null || true); hv="${hv//[^0-9]/}"; hv="${hv:-0}"; info "Persistence: $hv events"
 }
 
 # ============================================================
@@ -265,7 +268,8 @@ phase_persistence() {
 # ============================================================
 phase_privesc() {
     log "\n  ${MAG}── Phase 4: Privilege Escalation${NC}"
-    local rpt="$OUTDIR/phases/04_privesc.txt"; local h=0
+    local rpt="$OUTDIR/phases/04_privesc.txt"
+    local hc="$OUTDIR/raw/_cnt_04_privesc.txt"; echo 0 > "$hc"
     echo "PHASE 4: PRIVILEGE ESCALATION" > "$rpt"
     for xf in "$OUTDIR/xml_exports/"*.xml; do [ -f "$xf" ] || continue; local fn=$(basename "$xf")
         # EID 4720: Account Created
@@ -274,7 +278,7 @@ phase_privesc() {
             local nu=$(echo "$blk" | grep -oP 'TargetUserName">\K[^<]+' 2>/dev/null | head -1)
             local by=$(echo "$blk" | grep -oP 'SubjectUserName">\K[^<]+' 2>/dev/null | head -1)
             tl "$_TS" "HIGH" "Privilege Escalation" "T1136.001 Local Account" "$fn" "Account created: $nu by $by [4720]"
-            warn "Account created: $nu"; echo "[$_TS] New: $nu by $by" >> "$rpt"; h=$((h+1))
+            warn "Account created: $nu"; echo "[$_TS] New: $nu by $by" >> "$rpt"; echo x >> "$hc"
         done
         # EID 4728/4732: Group membership change
         grep -n -E '>(4728|4732)<' "$xf" 2>/dev/null | while IFS=: read -r ln _; do
@@ -282,7 +286,7 @@ phase_privesc() {
             local mb=$(echo "$blk" | grep -oP 'MemberName">\K[^<]+' 2>/dev/null | head -1)
             local grp=$(echo "$blk" | grep -oP 'TargetUserName">\K[^<]+' 2>/dev/null | head -1)
             tl "$_TS" "CRITICAL" "Privilege Escalation" "T1098 Account Manipulation" "$fn" "$mb added to $grp [$_EID]"
-            crit "$mb added to $grp"; echo "[$_TS] Group: $mb → $grp" >> "$rpt"; h=$((h+1))
+            crit "$mb added to $grp"; echo "[$_TS] Group: $mb → $grp" >> "$rpt"; echo x >> "$hc"
         done
         # EID 4672: Special privileges (non-system only)
         grep -n '>4672<' "$xf" 2>/dev/null | while IFS=: read -r ln _; do
@@ -291,15 +295,15 @@ phase_privesc() {
             echo "$u" | grep -qiE "^SYSTEM$|^LOCAL SERVICE$|^NETWORK SERVICE$|\\$$" && continue
             [ -z "$u" ] && continue
             tl "$_TS" "MEDIUM" "Privilege Escalation" "T1134 Token Manipulation" "$fn" "Special privs: $u [4672]"
-            echo "[$_TS] Privs: $u" >> "$rpt"; h=$((h+1))
+            echo "[$_TS] Privs: $u" >> "$rpt"; echo x >> "$hc"
         done
         # UAC bypass
         grep -n -iE 'fodhelper|eventvwr.*bypassuac|sdclt|computerdefaults' "$xf" 2>/dev/null | head -10 | while IFS=: read -r ln _; do
             ectx "$xf" "$ln"; local ml=$(sed -n "${ln}p" "$xf" | sed 's/^[[:space:]]*//' | cut -c1-300)
             tl "$_TS" "CRITICAL" "Privilege Escalation" "T1548.002 UAC Bypass" "$fn" "UAC bypass: $ml"
-            crit "UAC bypass!"; echo "[$_TS] UAC: $ml" >> "$rpt"; h=$((h+1))
+            crit "UAC bypass!"; echo "[$_TS] UAC: $ml" >> "$rpt"; echo x >> "$hc"
         done
-    done; info "Privilege Escalation: $h events"
+    done; local hv; hv=$(wc -l < "$hc" 2>/dev/null || true); hv="${hv//[^0-9]/}"; hv="${hv:-0}"; info "Privilege Escalation: $hv events"
 }
 
 # ============================================================
@@ -307,7 +311,8 @@ phase_privesc() {
 # ============================================================
 phase_defense_evasion() {
     log "\n  ${MAG}── Phase 5: Defense Evasion ★ PRIMARY${NC}"
-    local rpt="$OUTDIR/phases/05_defense_evasion.txt"; local h=0
+    local rpt="$OUTDIR/phases/05_defense_evasion.txt"
+    local hc="$OUTDIR/raw/_cnt_05_defense_evasion.txt"; echo 0 > "$hc"
     echo "PHASE 5: DEFENSE EVASION ★ MpPreference / Defender Tampering" > "$rpt"
     for xf in "$OUTDIR/xml_exports/"*.xml; do [ -f "$xf" ] || continue; local fn=$(basename "$xf")
         # ★ MpPreference / Defender tampering
@@ -326,7 +331,7 @@ phase_defense_evasion() {
             else
                 tl "$_TS" "HIGH" "Defense Evasion" "T1562.001 Disable Defenses" "$fn" "Defender change: $ml [$_EID]"
             fi
-            echo "[$_TS] MpPref: $ml" >> "$rpt"; h=$((h+1))
+            echo "[$_TS] MpPref: $ml" >> "$rpt"; echo x >> "$hc"
         done
         # EID 5001: RTP OFF / 5007: Config Change / 1116-1117: Malware
         grep -n -E '>(5001|5007|1116|1117)<' "$xf" 2>/dev/null | while IFS=: read -r ln _; do
@@ -337,37 +342,37 @@ phase_defense_evasion() {
                 5007) tl "$_TS" "HIGH" "Defense Evasion" "T1562.001 Disable Defenses" "$fn" "Defender config changed [5007]" ;;
                 1116|1117) local th=$(echo "$blk" | grep -i threat | head -1 | sed 's/^[[:space:]]*//' | cut -c1-200)
                       tl "$_TS" "HIGH" "Defense Evasion" "T1562 Impair Defenses" "$fn" "Malware event[$_EID]: $th" ;;
-            esac; echo "[$_TS] Defender[$_EID]" >> "$rpt"; h=$((h+1))
+            esac; echo "[$_TS] Defender[$_EID]" >> "$rpt"; echo x >> "$hc"
         done
         # AMSI Bypass
         grep -n -iE 'AmsiUtils|amsiInitFailed|AmsiScanBuffer|amsi\.dll|SetValue.*NonPublic.*amsi' "$xf" 2>/dev/null | while IFS=: read -r ln _; do
             ectx "$xf" "$ln"; local ml=$(sed -n "${ln}p" "$xf" | sed 's/^[[:space:]]*//' | cut -c1-300)
             tl "$_TS" "CRITICAL" "Defense Evasion" "T1562.001 AMSI Bypass" "$fn" "AMSI bypass: $ml [$_EID]"
-            crit "AMSI bypass!"; echo "[$_TS] AMSI: $ml" >> "$rpt"; h=$((h+1))
+            crit "AMSI bypass!"; echo "[$_TS] AMSI: $ml" >> "$rpt"; echo x >> "$hc"
         done
         # EID 1102: Audit Log Cleared
         grep -n '>1102<' "$xf" 2>/dev/null | while IFS=: read -r ln _; do
             ectx "$xf" "$ln"
             tl "$_TS" "CRITICAL" "Defense Evasion" "T1070.001 Clear Logs" "$fn" "★ AUDIT LOG CLEARED by $_USER [1102]"
-            crit "AUDIT LOG CLEARED!"; echo "[$_TS] LOG CLEARED by $_USER" >> "$rpt"; h=$((h+1))
+            crit "AUDIT LOG CLEARED!"; echo "[$_TS] LOG CLEARED by $_USER" >> "$rpt"; echo x >> "$hc"
         done
         # Log clearing commands
         grep -n -iE 'Clear-EventLog|wevtutil.*cl|Remove-Item.*\.evtx|Stop-Service.*EventLog' "$xf" 2>/dev/null | while IFS=: read -r ln _; do
             ectx "$xf" "$ln"; local ml=$(sed -n "${ln}p" "$xf" | sed 's/^[[:space:]]*//' | cut -c1-300)
             tl "$_TS" "CRITICAL" "Defense Evasion" "T1070.001 Clear Logs" "$fn" "Log clear cmd: $ml [$_EID]"
-            echo "[$_TS] Log clear: $ml" >> "$rpt"; h=$((h+1))
+            echo "[$_TS] Log clear: $ml" >> "$rpt"; echo x >> "$hc"
         done
         # Obfuscation/Encoding
         grep -n -iE 'EncodedCommand|FromBase64String|ToBase64String|GZipStream|DeflateStream|IO\.Compression|MemoryStream' "$xf" 2>/dev/null | head -100 | while IFS=: read -r ln _; do
             ectx "$xf" "$ln"; local ml=$(sed -n "${ln}p" "$xf" | sed 's/^[[:space:]]*//' | cut -c1-300)
             tl "$_TS" "HIGH" "Defense Evasion" "T1027 Obfuscation" "$fn" "Encoded: $ml [$_EID]"
-            echo "[$_TS] Encoded: $ml" >> "$rpt"; h=$((h+1))
+            echo "[$_TS] Encoded: $ml" >> "$rpt"; echo x >> "$hc"
         done
         # Execution policy bypass
         grep -n -iE 'ExecutionPolicy.*Bypass|Set-ExecutionPolicy.*Unrestricted' "$xf" 2>/dev/null | head -50 | while IFS=: read -r ln _; do
             ectx "$xf" "$ln"; local ml=$(sed -n "${ln}p" "$xf" | sed 's/^[[:space:]]*//' | cut -c1-200)
             tl "$_TS" "MEDIUM" "Defense Evasion" "T1059.001 ExecPolicy Bypass" "$fn" "Bypass: $ml [$_EID]"
-            echo "[$_TS] Bypass: $ml" >> "$rpt"; h=$((h+1))
+            echo "[$_TS] Bypass: $ml" >> "$rpt"; echo x >> "$hc"
         done
         # Timestomping (Sysmon 2)
         grep -n '>2<' "$xf" 2>/dev/null | while IFS=: read -r ln _; do
@@ -375,10 +380,11 @@ phase_defense_evasion() {
             local blk=$(sed -n "$((ln)),$((ln+20))p" "$xf" 2>/dev/null)
             local tf=$(echo "$blk" | grep -oP 'TargetFilename">\K[^<]+' 2>/dev/null | head -1)
             tl "$_TS" "HIGH" "Defense Evasion" "T1070.006 Timestomp" "$fn" "Timestomp: $tf [Sysmon2]"
-            echo "[$_TS] Timestomp: $tf" >> "$rpt"; h=$((h+1))
+            echo "[$_TS] Timestomp: $tf" >> "$rpt"; echo x >> "$hc"
         done
     done
-    [ "$h" -gt 0 ] && log "  ${RED}Defense Evasion: $h events ★ REVIEW NOW${NC}" || info "Defense Evasion: $h events"
+    local hv; hv=$(wc -l < "$hc" 2>/dev/null || true); hv="${hv//[^0-9]/}"; hv="${hv:-0}"
+    [ "$hv" -gt 0 ] && log "  ${RED}Defense Evasion: $hv events ★ REVIEW NOW${NC}" || info "Defense Evasion: $hv events"
 }
 
 # ============================================================
@@ -386,14 +392,15 @@ phase_defense_evasion() {
 # ============================================================
 phase_credential_access() {
     log "\n  ${MAG}── Phase 6: Credential Access${NC}"
-    local rpt="$OUTDIR/phases/06_credential_access.txt"; local h=0
+    local rpt="$OUTDIR/phases/06_credential_access.txt"
+    local hc="$OUTDIR/raw/_cnt_06_credential_access.txt"; echo 0 > "$hc"
     echo "PHASE 6: CREDENTIAL ACCESS" > "$rpt"
     for xf in "$OUTDIR/xml_exports/"*.xml; do [ -f "$xf" ] || continue; local fn=$(basename "$xf")
         # Mimikatz / LSASS / credential dumping
         grep -n -iE 'Mimikatz|sekurlsa|lsass\.exe|procdump.*lsass|comsvcs.*MiniDump|privilege::debug|token::elevate|vault::cred|dpapi::' "$xf" 2>/dev/null | while IFS=: read -r ln _; do
             ectx "$xf" "$ln"; local ml=$(sed -n "${ln}p" "$xf" | sed 's/^[[:space:]]*//' | cut -c1-300)
             tl "$_TS" "CRITICAL" "Credential Access" "T1003 Credential Dumping" "$fn" "CredDump: $ml [$_EID]"
-            crit "Credential dumping!"; echo "[$_TS] $ml" >> "$rpt"; h=$((h+1))
+            crit "Credential dumping!"; echo "[$_TS] $ml" >> "$rpt"; echo x >> "$hc"
         done
         # Sysmon 10: ProcessAccess to LSASS
         grep -n '>10<' "$xf" 2>/dev/null | while IFS=: read -r ln _; do
@@ -403,24 +410,24 @@ phase_credential_access() {
             local src=$(echo "$blk" | grep -oP 'SourceImage">\K[^<]+' 2>/dev/null | head -1)
             echo "$tgt" | grep -qi "lsass" && {
                 tl "$_TS" "CRITICAL" "Credential Access" "T1003.001 LSASS Memory" "$fn" "LSASS access by $src [Sysmon10]"
-                crit "LSASS access: $src"; echo "[$_TS] LSASS: $src → $tgt" >> "$rpt"; h=$((h+1))
+                crit "LSASS access: $src"; echo "[$_TS] LSASS: $src → $tgt" >> "$rpt"; echo x >> "$hc"
             }
         done
         # Credential commands
         grep -n -iE 'Get-Credential|SecureStringToBSTR|Net\.NetworkCredential|cmdkey.*/add' "$xf" 2>/dev/null | head -50 | while IFS=: read -r ln _; do
             ectx "$xf" "$ln"; local ml=$(sed -n "${ln}p" "$xf" | sed 's/^[[:space:]]*//' | cut -c1-300)
             tl "$_TS" "HIGH" "Credential Access" "T1555 Credential Stores" "$fn" "Cred cmd: $ml [$_EID]"
-            echo "[$_TS] $ml" >> "$rpt"; h=$((h+1))
+            echo "[$_TS] $ml" >> "$rpt"; echo x >> "$hc"
         done
         # NTLM brute force (EID 4776)
-        local nf=$(grep -c '>4776<' "$xf" 2>/dev/null || echo 0)
+        local nf; nf=$(grep -c '>4776<' "$xf" 2>/dev/null || true); nf="${nf//[^0-9]/}"; nf="${nf:-0}"
         [ "$nf" -gt 20 ] && {
             local fl=$(grep -n '>4776<' "$xf" | head -1 | cut -d: -f1)
             [ -n "$fl" ] && ectx "$xf" "$fl"
             tl "$_TS" "HIGH" "Credential Access" "T1110 Brute Force" "$fn" "$nf NTLM auth events [4776]"
-            warn "NTLM brute: $nf events"; echo "[$_TS] NTLM: $nf events" >> "$rpt"; h=$((h+1))
+            warn "NTLM brute: $nf events"; echo "[$_TS] NTLM: $nf events" >> "$rpt"; echo x >> "$hc"
         }
-    done; info "Credential Access: $h events"
+    done; local hv; hv=$(wc -l < "$hc" 2>/dev/null || true); hv="${hv//[^0-9]/}"; hv="${hv:-0}"; info "Credential Access: $hv events"
 }
 
 # ============================================================
@@ -428,16 +435,17 @@ phase_credential_access() {
 # ============================================================
 phase_discovery() {
     log "\n  ${MAG}── Phase 7: Discovery${NC}"
-    local rpt="$OUTDIR/phases/07_discovery.txt"; local h=0
+    local rpt="$OUTDIR/phases/07_discovery.txt"
+    local hc="$OUTDIR/raw/_cnt_07_discovery.txt"; echo 0 > "$hc"
     echo "PHASE 7: DISCOVERY" > "$rpt"
     for xf in "$OUTDIR/xml_exports/"*.xml; do [ -f "$xf" ] || continue; local fn=$(basename "$xf")
         grep -n -iE 'Get-ADUser|Get-ADComputer|Get-ADGroup|Get-DomainUser|Get-NetComputer|nltest|dsquery' "$xf" 2>/dev/null | head -50 | while IFS=: read -r ln _; do
             ectx "$xf" "$ln"; local ml=$(sed -n "${ln}p" "$xf" | sed 's/^[[:space:]]*//' | cut -c1-300)
-            tl "$_TS" "HIGH" "Discovery" "T1087 Account Discovery" "$fn" "AD recon: $ml [$_EID]"; h=$((h+1))
+            tl "$_TS" "HIGH" "Discovery" "T1087 Account Discovery" "$fn" "AD recon: $ml [$_EID]"; echo x >> "$hc"
         done
         grep -n -iE 'whoami.*/priv|net user|net group|net localgroup|net share|net view|ipconfig.*/all|systeminfo|tasklist' "$xf" 2>/dev/null | head -100 | while IFS=: read -r ln _; do
             ectx "$xf" "$ln"; local ml=$(sed -n "${ln}p" "$xf" | sed 's/^[[:space:]]*//' | cut -c1-200)
-            tl "$_TS" "MEDIUM" "Discovery" "T1082 System Info" "$fn" "Recon: $ml [$_EID]"; h=$((h+1))
+            tl "$_TS" "MEDIUM" "Discovery" "T1082 System Info" "$fn" "Recon: $ml [$_EID]"; echo x >> "$hc"
         done
         # Sysmon 22: DNS with suspicious TLDs
         grep -n '>22<' "$xf" 2>/dev/null | while IFS=: read -r ln _; do
@@ -445,28 +453,29 @@ phase_discovery() {
             local blk=$(sed -n "$((ln)),$((ln+15))p" "$xf" 2>/dev/null)
             local qn=$(echo "$blk" | grep -oP 'QueryName">\K[^<]+' 2>/dev/null | head -1)
             echo "$qn" | grep -qiE "\.xyz|\.top|\.tk|\.ml|\.ga|duckdns|ngrok|interactsh|oast|nova|c2|beacon" && {
-                tl "$_TS" "HIGH" "Discovery" "T1018 Remote Discovery" "$fn" "Suspicious DNS: $qn [Sysmon22]"; h=$((h+1))
+                tl "$_TS" "HIGH" "Discovery" "T1018 Remote Discovery" "$fn" "Suspicious DNS: $qn [Sysmon22]"; echo x >> "$hc"
             }
         done
-    done; info "Discovery: $h events"
+    done; local hv; hv=$(wc -l < "$hc" 2>/dev/null || true); hv="${hv//[^0-9]/}"; hv="${hv:-0}"; info "Discovery: $hv events"
 }
 
 phase_lateral_movement() {
     log "\n  ${MAG}── Phase 8: Lateral Movement${NC}"
-    local rpt="$OUTDIR/phases/08_lateral_movement.txt"; local h=0
+    local rpt="$OUTDIR/phases/08_lateral_movement.txt"
+    local hc="$OUTDIR/raw/_cnt_08_lateral_movement.txt"; echo 0 > "$hc"
     echo "PHASE 8: LATERAL MOVEMENT" > "$rpt"
     for xf in "$OUTDIR/xml_exports/"*.xml; do [ -f "$xf" ] || continue; local fn=$(basename "$xf")
         grep -n -iE 'Enter-PSSession|Invoke-Command.*-Computer|New-PSSession|Enable-PSRemoting|WinRM|Test-WSMan' "$xf" 2>/dev/null | head -50 | while IFS=: read -r ln _; do
             ectx "$xf" "$ln"; local ml=$(sed -n "${ln}p" "$xf" | sed 's/^[[:space:]]*//' | cut -c1-300)
-            tl "$_TS" "HIGH" "Lateral Movement" "T1021.006 WinRM" "$fn" "PSRemoting: $ml [$_EID]"; h=$((h+1))
+            tl "$_TS" "HIGH" "Lateral Movement" "T1021.006 WinRM" "$fn" "PSRemoting: $ml [$_EID]"; echo x >> "$hc"
         done
         grep -n -iE 'psexec|wmic.*process.*call.*create|wmic.*/node:' "$xf" 2>/dev/null | head -30 | while IFS=: read -r ln _; do
             ectx "$xf" "$ln"; local ml=$(sed -n "${ln}p" "$xf" | sed 's/^[[:space:]]*//' | cut -c1-300)
-            tl "$_TS" "HIGH" "Lateral Movement" "T1021.002 SMB/Admin" "$fn" "PsExec/WMIC: $ml [$_EID]"; h=$((h+1))
+            tl "$_TS" "HIGH" "Lateral Movement" "T1021.002 SMB/Admin" "$fn" "PsExec/WMIC: $ml [$_EID]"; echo x >> "$hc"
         done
         grep -n -iE 'tscon\.exe|mstsc.*/v:' "$xf" 2>/dev/null | head -20 | while IFS=: read -r ln _; do
             ectx "$xf" "$ln"; local ml=$(sed -n "${ln}p" "$xf" | sed 's/^[[:space:]]*//' | cut -c1-200)
-            tl "$_TS" "HIGH" "Lateral Movement" "T1021.001 RDP" "$fn" "RDP: $ml [$_EID]"; h=$((h+1))
+            tl "$_TS" "HIGH" "Lateral Movement" "T1021.001 RDP" "$fn" "RDP: $ml [$_EID]"; echo x >> "$hc"
         done
         # Sysmon 3: Internal network pivots
         grep -n '>3<' "$xf" 2>/dev/null | while IFS=: read -r ln _; do
@@ -476,61 +485,64 @@ phase_lateral_movement() {
             local dp=$(echo "$blk" | grep -oP 'DestinationPort">\K[^<]+' 2>/dev/null | head -1)
             local img=$(echo "$blk" | grep -oP 'Image">\K[^<]+' 2>/dev/null | head -1)
             echo "$dp" | grep -qE "^(445|5985|5986|3389|22|135)$" && echo "$di" | grep -qE "^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.)" && {
-                tl "$_TS" "MEDIUM" "Lateral Movement" "T1021 Remote Services" "$fn" "Internal: $img → $di:$dp [Sysmon3]"; h=$((h+1))
+                tl "$_TS" "MEDIUM" "Lateral Movement" "T1021 Remote Services" "$fn" "Internal: $img → $di:$dp [Sysmon3]"; echo x >> "$hc"
             }
         done
-    done; info "Lateral Movement: $h events"
+    done; local hv; hv=$(wc -l < "$hc" 2>/dev/null || true); hv="${hv//[^0-9]/}"; hv="${hv:-0}"; info "Lateral Movement: $hv events"
 }
 
 phase_collection() {
     log "\n  ${MAG}── Phase 9: Collection${NC}"
-    local rpt="$OUTDIR/phases/09_collection.txt"; local h=0
+    local rpt="$OUTDIR/phases/09_collection.txt"
+    local hc="$OUTDIR/raw/_cnt_09_collection.txt"; echo 0 > "$hc"
     echo "PHASE 9: COLLECTION" > "$rpt"
     for xf in "$OUTDIR/xml_exports/"*.xml; do [ -f "$xf" ] || continue; local fn=$(basename "$xf")
         grep -n -iE 'Compress-Archive|7z\.exe.*a |rar\.exe.*a |makecab|tar.*czf' "$xf" 2>/dev/null | head -30 | while IFS=: read -r ln _; do
             ectx "$xf" "$ln"; local ml=$(sed -n "${ln}p" "$xf" | sed 's/^[[:space:]]*//' | cut -c1-300)
-            tl "$_TS" "HIGH" "Collection" "T1560.001 Archive Data" "$fn" "Archive: $ml [$_EID]"; h=$((h+1))
+            tl "$_TS" "HIGH" "Collection" "T1560.001 Archive Data" "$fn" "Archive: $ml [$_EID]"; echo x >> "$hc"
         done
         grep -n -iE 'GetAsyncKeyState|SetWindowsHookEx|keylog|Get-Keystrokes|screenshot|CopyFromScreen' "$xf" 2>/dev/null | head -20 | while IFS=: read -r ln _; do
             ectx "$xf" "$ln"; local ml=$(sed -n "${ln}p" "$xf" | sed 's/^[[:space:]]*//' | cut -c1-200)
             tl "$_TS" "CRITICAL" "Collection" "T1056 Input Capture" "$fn" "Keylog/Screen: $ml [$_EID]"
-            crit "Keylogger/screen capture!"; h=$((h+1))
+            crit "Keylogger/screen capture!"; echo x >> "$hc"
         done
-    done; info "Collection: $h events"
+    done; local hv; hv=$(wc -l < "$hc" 2>/dev/null || true); hv="${hv//[^0-9]/}"; hv="${hv:-0}"; info "Collection: $hv events"
 }
 
 phase_exfiltration() {
     log "\n  ${MAG}── Phase 10: Exfiltration${NC}"
-    local rpt="$OUTDIR/phases/10_exfiltration.txt"; local h=0
+    local rpt="$OUTDIR/phases/10_exfiltration.txt"
+    local hc="$OUTDIR/raw/_cnt_10_exfiltration.txt"; echo 0 > "$hc"
     echo "PHASE 10: EXFILTRATION" > "$rpt"
     for xf in "$OUTDIR/xml_exports/"*.xml; do [ -f "$xf" ] || continue; local fn=$(basename "$xf")
         grep -n -iE 'Invoke-WebRequest.*POST|Invoke-RestMethod.*POST|WebClient.*Upload|UploadFile|UploadString|BitsTransfer.*Upload' "$xf" 2>/dev/null | head -30 | while IFS=: read -r ln _; do
             ectx "$xf" "$ln"; local ml=$(sed -n "${ln}p" "$xf" | sed 's/^[[:space:]]*//' | cut -c1-300)
             tl "$_TS" "CRITICAL" "Exfiltration" "T1041 C2 Channel Exfil" "$fn" "Upload: $ml [$_EID]"
-            crit "Data exfiltration!"; h=$((h+1))
+            crit "Data exfiltration!"; echo x >> "$hc"
         done
         grep -n -iE 'aws.*s3.*cp|azcopy|gsutil.*cp|rclone|mega-put' "$xf" 2>/dev/null | head -20 | while IFS=: read -r ln _; do
             ectx "$xf" "$ln"; local ml=$(sed -n "${ln}p" "$xf" | sed 's/^[[:space:]]*//' | cut -c1-300)
-            tl "$_TS" "CRITICAL" "Exfiltration" "T1567 Cloud Exfil" "$fn" "Cloud: $ml [$_EID]"; h=$((h+1))
+            tl "$_TS" "CRITICAL" "Exfiltration" "T1567 Cloud Exfil" "$fn" "Cloud: $ml [$_EID]"; echo x >> "$hc"
         done
-    done; info "Exfiltration: $h events"
+    done; local hv; hv=$(wc -l < "$hc" 2>/dev/null || true); hv="${hv//[^0-9]/}"; hv="${hv:-0}"; info "Exfiltration: $hv events"
 }
 
 phase_c2() {
     log "\n  ${MAG}── Phase 11: Command & Control${NC}"
-    local rpt="$OUTDIR/phases/11_c2.txt"; local h=0
+    local rpt="$OUTDIR/phases/11_c2.txt"
+    local hc="$OUTDIR/raw/_cnt_11_c2.txt"; echo 0 > "$hc"
     echo "PHASE 11: C2" > "$rpt"
     for xf in "$OUTDIR/xml_exports/"*.xml; do [ -f "$xf" ] || continue; local fn=$(basename "$xf")
         # Download cradles
         grep -n -iE 'Invoke-WebRequest|Net\.WebClient|DownloadString|DownloadFile|DownloadData|Start-BitsTransfer|certutil.*-urlcache|certutil.*-decode|bitsadmin.*transfer' "$xf" 2>/dev/null | head -100 | while IFS=: read -r ln _; do
             ectx "$xf" "$ln"; local ml=$(sed -n "${ln}p" "$xf" | sed 's/^[[:space:]]*//' | cut -c1-300)
-            tl "$_TS" "HIGH" "Command and Control" "T1105 Ingress Tool" "$fn" "Download: $ml [$_EID]"; h=$((h+1))
+            tl "$_TS" "HIGH" "Command and Control" "T1105 Ingress Tool" "$fn" "Download: $ml [$_EID]"; echo x >> "$hc"
         done
         # C2 framework IOCs
         grep -n -iE '[Nn]ova|beacon|cobalt.?strike|sliver|havoc|metasploit|meterpreter|empire|callbackURI|stager|implant' "$xf" 2>/dev/null | head -50 | while IFS=: read -r ln _; do
             ectx "$xf" "$ln"; local ml=$(sed -n "${ln}p" "$xf" | sed 's/^[[:space:]]*//' | cut -c1-300)
             tl "$_TS" "CRITICAL" "Command and Control" "T1071 App Layer C2" "$fn" "★ C2 IOC: $ml [$_EID]"
-            crit "C2 framework: $ml"; h=$((h+1))
+            crit "C2 framework: $ml"; echo x >> "$hc"
         done
         # Sysmon 3: C2 ports
         grep -n '>3<' "$xf" 2>/dev/null | while IFS=: read -r ln _; do
@@ -541,36 +553,37 @@ phase_c2() {
             local img=$(echo "$blk" | grep -oP 'Image">\K[^<]+' 2>/dev/null | head -1)
             echo "$dp" | grep -qE "^(4444|5555|8443|8080|9090|1337|31337|6666|6667|4443|2222|3333|7777|9999|13337)$" && {
                 tl "$_TS" "CRITICAL" "Command and Control" "T1571 Non-Standard Port" "$fn" "C2 port: $img → $di:$dp [Sysmon3]"
-                crit "C2 port: $di:$dp"; h=$((h+1))
+                crit "C2 port: $di:$dp"; echo x >> "$hc"
             }
         done
         # Tunneling
         grep -n -iE 'netsh.*portproxy|ssh.*-R |ssh.*-D |plink.*-R|chisel|ligolo|ngrok' "$xf" 2>/dev/null | head -20 | while IFS=: read -r ln _; do
             ectx "$xf" "$ln"; local ml=$(sed -n "${ln}p" "$xf" | sed 's/^[[:space:]]*//' | cut -c1-300)
-            tl "$_TS" "HIGH" "Command and Control" "T1572 Tunneling" "$fn" "Tunnel: $ml [$_EID]"; h=$((h+1))
+            tl "$_TS" "HIGH" "Command and Control" "T1572 Tunneling" "$fn" "Tunnel: $ml [$_EID]"; echo x >> "$hc"
         done
-    done; info "C2: $h events"
+    done; local hv; hv=$(wc -l < "$hc" 2>/dev/null || true); hv="${hv//[^0-9]/}"; hv="${hv:-0}"; info "C2: $hv events"
 }
 
 phase_impact() {
     log "\n  ${MAG}── Phase 12: Impact${NC}"
-    local rpt="$OUTDIR/phases/12_impact.txt"; local h=0
+    local rpt="$OUTDIR/phases/12_impact.txt"
+    local hc="$OUTDIR/raw/_cnt_12_impact.txt"; echo 0 > "$hc"
     echo "PHASE 12: IMPACT" > "$rpt"
     for xf in "$OUTDIR/xml_exports/"*.xml; do [ -f "$xf" ] || continue; local fn=$(basename "$xf")
         grep -n -iE 'ransom|\.locked|decrypt|bitcoin|vssadmin.*delete.*shadows|bcdedit.*recoveryenabled.*no|wbadmin.*delete.*catalog' "$xf" 2>/dev/null | head -30 | while IFS=: read -r ln _; do
             ectx "$xf" "$ln"; local ml=$(sed -n "${ln}p" "$xf" | sed 's/^[[:space:]]*//' | cut -c1-300)
             tl "$_TS" "CRITICAL" "Impact" "T1486 Ransomware" "$fn" "Ransomware: $ml [$_EID]"
-            crit "Ransomware!"; h=$((h+1))
+            crit "Ransomware!"; echo x >> "$hc"
         done
         grep -n -iE 'Stop-Service|net stop|sc\.exe.*stop|taskkill.*/f' "$xf" 2>/dev/null | head -30 | while IFS=: read -r ln _; do
             ectx "$xf" "$ln"; local ml=$(sed -n "${ln}p" "$xf" | sed 's/^[[:space:]]*//' | cut -c1-200)
-            tl "$_TS" "MEDIUM" "Impact" "T1489 Service Stop" "$fn" "Svc stop: $ml [$_EID]"; h=$((h+1))
+            tl "$_TS" "MEDIUM" "Impact" "T1489 Service Stop" "$fn" "Svc stop: $ml [$_EID]"; echo x >> "$hc"
         done
         grep -n -iE 'Remove-Item.*-Recurse.*-Force|del.*/f.*/s.*/q|format.*c:|cipher.*/w:' "$xf" 2>/dev/null | head -20 | while IFS=: read -r ln _; do
             ectx "$xf" "$ln"; local ml=$(sed -n "${ln}p" "$xf" | sed 's/^[[:space:]]*//' | cut -c1-200)
-            tl "$_TS" "CRITICAL" "Impact" "T1485 Data Destruction" "$fn" "Destroy: $ml [$_EID]"; h=$((h+1))
+            tl "$_TS" "CRITICAL" "Impact" "T1485 Data Destruction" "$fn" "Destroy: $ml [$_EID]"; echo x >> "$hc"
         done
-    done; info "Impact: $h events"
+    done; local hv; hv=$(wc -l < "$hc" 2>/dev/null || true); hv="${hv//[^0-9]/}"; hv="${hv:-0}"; info "Impact: $hv events"
 }
 
 # ============================================================
@@ -580,9 +593,9 @@ build_timeline() {
     hdr "[4/4] Building Unified Attack Timeline"
 
     sort -t$'\t' -k1,1 "$TL_RAW" > "$OUTDIR/raw/_timeline_sorted.tsv"
-    local tot=$(wc -l < "$OUTDIR/raw/_timeline_sorted.tsv")
-    local nc=$(grep -c 'CRITICAL' "$OUTDIR/raw/_timeline_sorted.tsv" 2>/dev/null || echo 0)
-    local nh=$(grep -c 'HIGH' "$OUTDIR/raw/_timeline_sorted.tsv" 2>/dev/null || echo 0)
+    local tot; tot=$(wc -l < "$OUTDIR/raw/_timeline_sorted.tsv" 2>/dev/null || true); tot="${tot//[^0-9]/}"; tot="${tot:-0}"
+    local nc; nc=$(grep -c 'CRITICAL' "$OUTDIR/raw/_timeline_sorted.tsv" 2>/dev/null || true); nc="${nc//[^0-9]/}"; nc="${nc:-0}"
+    local nh; nh=$(grep -c 'HIGH' "$OUTDIR/raw/_timeline_sorted.tsv" 2>/dev/null || true); nh="${nh//[^0-9]/}"; nh="${nh:-0}"
 
     # Human-readable timeline
     {
@@ -627,9 +640,9 @@ build_timeline() {
         echo "================================================================"
         echo ""
         for tac in "Initial Access" "Execution" "Persistence" "Privilege Escalation" "Defense Evasion" "Credential Access" "Discovery" "Lateral Movement" "Collection" "Exfiltration" "Command and Control" "Impact"; do
-            local t=$(grep -c "$tac" "$OUTDIR/raw/_timeline_sorted.tsv" 2>/dev/null || echo 0)
-            local c=$(grep "$tac" "$OUTDIR/raw/_timeline_sorted.tsv" 2>/dev/null | grep -c "CRITICAL" 2>/dev/null || echo 0)
-            local hi=$(grep "$tac" "$OUTDIR/raw/_timeline_sorted.tsv" 2>/dev/null | grep -c "HIGH" 2>/dev/null || echo 0)
+            local t; t=$(grep -c "$tac" "$OUTDIR/raw/_timeline_sorted.tsv" 2>/dev/null || true); t="${t//[^0-9]/}"; t="${t:-0}"
+            local c; c=$(grep "$tac" "$OUTDIR/raw/_timeline_sorted.tsv" 2>/dev/null | grep -c "CRITICAL" 2>/dev/null || true); c="${c//[^0-9]/}"; c="${c:-0}"
+            local hi; hi=$(grep "$tac" "$OUTDIR/raw/_timeline_sorted.tsv" 2>/dev/null | grep -c "HIGH" 2>/dev/null || true); hi="${hi//[^0-9]/}"; hi="${hi:-0}"
             local bar=""; for ((i=0;i<t&&i<60;i++)); do bar+="█"; done; [ "$t" -gt 60 ] && bar+="→"
             printf "  %-24s %5d (%d crit %d high) %s\n" "$tac" "$t" "$c" "$hi" "$bar"
         done
