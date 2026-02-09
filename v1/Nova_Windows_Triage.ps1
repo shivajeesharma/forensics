@@ -17,7 +17,8 @@ param(
     [string]$OutputDir = "$env:USERPROFILE\Desktop\Nova_Triage_$(Get-Date -Format 'yyyyMMdd_HHmmss')"
 )
 
-$ErrorActionPreference = "SilentlyContinue"
+# NOTE: We use -ErrorAction SilentlyContinue on individual commands rather than
+# globally suppressing errors, so collection failures are visible in the log.
 
 # ── Setup ──────────────────────────────────────────────────────────────────────
 New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
@@ -80,7 +81,7 @@ Write-Log "Scanning for .ralord encrypted files..."
 $encryptedFiles = @()
 foreach ($drive in (Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Used -gt 0 })) {
     try {
-        $found = Get-ChildItem -Path "$($drive.Root)" -Filter "*.ralord" -Recurse -ErrorAction SilentlyContinue |
+        $found = Get-ChildItem -Path "$($drive.Root)" -Filter "*.ralord" -Recurse -Depth 15 -ErrorAction SilentlyContinue |
                  Select-Object FullName, Length, CreationTimeUtc, LastWriteTimeUtc -First 500
         $encryptedFiles += $found
     } catch {}
@@ -113,7 +114,7 @@ foreach ($drive in (Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Used 
                     Size         = $f.Length
                     Modified     = $f.LastWriteTimeUtc
                     NovaConfirm  = $novaMatch
-                    ContentSnip  = if ($content) { $content.Substring(0, [Math]::Min(500, $content.Length)) } else { "" }
+                    ContentSnip  = $(if ($content) { $content.Substring(0, [Math]::Min(500, $content.Length)) } else { "" })
                 }
             }
         } catch {}
@@ -135,16 +136,26 @@ if ($ransomNotes.Count -gt 0) {
 # 4. RUNNING PROCESSES
 # ══════════════════════════════════════════════════════════════════════════════
 Write-Log "Capturing running processes..."
-$procs = Get-Process | Select-Object Id, ProcessName, Path, StartTime, Company,
-    @{N='CommandLine';E={(Get-CimInstance Win32_Process -Filter "ProcessId=$($_.Id)").CommandLine}},
-    @{N='ParentPID';E={(Get-CimInstance Win32_Process -Filter "ProcessId=$($_.Id)").ParentProcessId}}
+# Single WMI query upfront instead of per-process queries (orders of magnitude faster)
+$wmiProcs = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+    Select-Object ProcessId, Name, ExecutablePath, CommandLine, ParentProcessId, CreationDate
+$wmiLookup = @{}
+foreach ($wp in $wmiProcs) { $wmiLookup[$wp.ProcessId] = $wp }
+
+$procs = Get-Process -ErrorAction SilentlyContinue | Select-Object Id, ProcessName, Path, StartTime, Company,
+    @{N='CommandLine';E={ $wmiLookup[[int]$_.Id].CommandLine }},
+    @{N='ParentPID';E={ $wmiLookup[[int]$_.Id].ParentProcessId }}
 
 $procs | Export-Csv (Join-Path $OutputDir "04_processes.csv") -NoTypeInformation
 
-# Flag suspicious
+# Flag suspicious - proper filter logic
 $suspProcs = $procs | Where-Object {
     $name = $_.ProcessName.ToLower()
-    $NovaIOCs.SuspTools | ForEach-Object { if ($name -like "*$_*") { return $true } }
+    $matched = $false
+    foreach ($tool in $NovaIOCs.SuspTools) {
+        if ($name -like "*$tool*") { $matched = $true; break }
+    }
+    $matched
 }
 
 if ($suspProcs) {
@@ -292,29 +303,26 @@ if ($logClears) {
     $logClears | Select-Object TimeCreated, Id, Message | Export-Csv (Join-Path $OutputDir "09_log_clearing.csv") -NoTypeInformation
 }
 
-# RDP Logons (4624 Type 10)
-$rdpLogons = Get-WinEvent -FilterHashtable @{LogName='Security'; ID=4624} -MaxEvents 500 -ErrorAction SilentlyContinue |
-    Where-Object { $_.Message -match "Logon Type:\s+10" } |
-    Select-Object TimeCreated, @{N='SourceIP';E={
+# Logon events (4624) - single query, filter in memory for Type 10 (RDP) and Type 3 (Network)
+$allLogons = Get-WinEvent -FilterHashtable @{LogName='Security'; ID=4624} -MaxEvents 500 -ErrorAction SilentlyContinue |
+    Select-Object TimeCreated, Message,
+    @{N='LogonType';E={
+        if ($_.Message -match "Logon Type:\s+(\d+)") { $matches[1] }
+    }},
+    @{N='SourceIP';E={
         if ($_.Message -match "Source Network Address:\s+(\S+)") { $matches[1] }
-    }}, @{N='Account';E={
+    }},
+    @{N='Account';E={
         if ($_.Message -match "Account Name:\s+(\S+)") { $matches[1] }
     }}
 
+$rdpLogons = $allLogons | Where-Object { $_.LogonType -eq "10" } | Select-Object TimeCreated, SourceIP, Account
 if ($rdpLogons) {
     Write-Log "RDP LOGON EVENTS: $($rdpLogons.Count)" "WARNING"
     $rdpLogons | Export-Csv (Join-Path $OutputDir "09_rdp_logons.csv") -NoTypeInformation
 }
 
-# Network Logons (4624 Type 3)
-$netLogons = Get-WinEvent -FilterHashtable @{LogName='Security'; ID=4624} -MaxEvents 500 -ErrorAction SilentlyContinue |
-    Where-Object { $_.Message -match "Logon Type:\s+3" } |
-    Select-Object TimeCreated, @{N='SourceIP';E={
-        if ($_.Message -match "Source Network Address:\s+(\S+)") { $matches[1] }
-    }}, @{N='Account';E={
-        if ($_.Message -match "Account Name:\s+(\S+)") { $matches[1] }
-    }}
-
+$netLogons = $allLogons | Where-Object { $_.LogonType -eq "3" } | Select-Object TimeCreated, SourceIP, Account
 if ($netLogons) {
     Write-Log "NETWORK LOGON EVENTS: $($netLogons.Count)" "INFO"
     $netLogons | Export-Csv (Join-Path $OutputDir "09_network_logons.csv") -NoTypeInformation
@@ -395,7 +403,7 @@ $recentDirs = @("$env:SYSTEMROOT\System32", "$env:SYSTEMROOT\Temp", "$env:TEMP",
 $recentFiles = @()
 foreach ($rd in $recentDirs) {
     if (Test-Path $rd) {
-        $recentFiles += Get-ChildItem -Path $rd -File -ErrorAction SilentlyContinue |
+        $recentFiles += Get-ChildItem -Path $rd -File -Recurse -Depth 3 -ErrorAction SilentlyContinue |
             Where-Object { $_.LastWriteTime -gt $cutoff -and $_.Extension -match "\.(exe|dll|bat|ps1|vbs|js|hta|cmd|sys)$" } |
             Select-Object FullName, Extension, @{N='SizeMB';E={[Math]::Round($_.Length/1MB,2)}}, LastWriteTime, CreationTime -First 200
     }

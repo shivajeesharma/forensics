@@ -49,7 +49,7 @@ rule Nova_RALord_Encrypted_File
         $marker3 = "NOVA_ENCRYPTED" ascii wide
     
     condition:
-        any of them at (filesize - 32) or
+        any of them in (filesize - 64 .. filesize) or
         any of them at 0
 }
 
@@ -87,8 +87,8 @@ rule Nova_RALord_Payload_Windows
         uint16(0) == 0x5A4D and
         filesize < 20MB and
         any of ($rust*) and
-        (any of ($enc*) and any of ($del*)) or
-        (any of ($enc*) and any of ($svc*))
+        ((any of ($enc*) and any of ($del*)) or
+         (any of ($enc*) and any of ($svc*)))
 }
 
 rule Nova_RALord_Payload_Linux
@@ -183,7 +183,7 @@ rule Nova_Exfiltration_Rclone_Config
         mitre       = "T1048"
     
     strings:
-        $header = "[" ascii
+        $header = /\[\w+\]/ ascii
         $type1  = "type = mega" ascii nocase
         $type2  = "type = s3" ascii nocase
         $type3  = "type = ftp" ascii nocase
@@ -225,7 +225,7 @@ rule Nova_Lateral_Movement_Batch
     
     condition:
         filesize < 50KB and
-        (any of ($psexec, $wmic1, $wmic2) and any of ($admin, $c_share, $ipc)) or
-        ($schtask and $net1 and any of ($loop*)) or
-        (any of ($copy*) and any of ($admin, $c_share) and $ip_pat)
+        ((any of ($psexec, $wmic1, $wmic2) and any of ($admin, $c_share, $ipc)) or
+         ($schtask and $net1 and any of ($loop*)) or
+         (any of ($copy*) and any of ($admin, $c_share) and $ip_pat))
 }

@@ -142,6 +142,12 @@ MITRE_MAPPING = {
     "T1018": "Remote System Discovery - Network scanning tools",
     "T1570": "Lateral Tool Transfer - Moving tools across network",
     "T1055": "Process Injection - Evading detection",
+    "T1003": "OS Credential Dumping - LSASS, SAM, NTDS.dit extraction",
+    "T1136": "Create Account - Attacker-created local/domain accounts",
+    "T1197": "BITS Jobs - Background transfer for persistence/exfil",
+    "T1546": "Event Triggered Execution - WMI event subscriptions",
+    "T1547": "Boot or Logon Autostart Execution - Registry run keys",
+    "T1074": "Data Staged - Archives staged for exfiltration",
 }
 
 
@@ -213,8 +219,54 @@ def safe_stat(filepath: str) -> Optional[Dict]:
     except (PermissionError, OSError):
         return None
 
+def run_cmd_list(cmd_args: List[str], timeout: int = 60) -> Tuple[str, str, int]:
+    """Execute a command as a list (no shell) — safer on compromised hosts."""
+    try:
+        r = subprocess.run(cmd_args, capture_output=True, text=True, timeout=timeout)
+        return r.stdout.strip(), r.stderr.strip(), r.returncode
+    except subprocess.TimeoutExpired:
+        return "", "TIMEOUT", -1
+    except Exception as e:
+        return "", str(e), -1
+
 def severity_label(sev: int) -> str:
     return {1: "INFO", 2: "LOW", 3: "MEDIUM", 4: "HIGH", 5: "CRITICAL"}.get(sev, "UNKNOWN")
+
+
+class SystemDataCache:
+    """Cache shared data so modules don't re-run the same expensive commands."""
+
+    def __init__(self):
+        self._process_list: Optional[str] = None
+        self._netstat_output: Optional[str] = None
+
+    def get_process_list(self) -> str:
+        if self._process_list is None:
+            os_type = get_os_type()
+            if os_type == "windows":
+                self._process_list, _, _ = run_cmd("tasklist /v /fo csv 2>nul")
+            else:
+                self._process_list, _, _ = run_cmd("ps auxww 2>/dev/null")
+        return self._process_list
+
+    def get_netstat_output(self) -> str:
+        if self._netstat_output is None:
+            os_type = get_os_type()
+            if os_type == "windows":
+                self._netstat_output, _, _ = run_cmd("netstat -naob 2>nul", timeout=15)
+            else:
+                self._netstat_output, _, _ = run_cmd("ss -tunap 2>/dev/null || netstat -tunap 2>/dev/null", timeout=15)
+        return self._netstat_output
+
+
+# Global shared cache — instantiated once in main()
+_system_cache: Optional[SystemDataCache] = None
+
+def get_system_cache() -> SystemDataCache:
+    global _system_cache
+    if _system_cache is None:
+        _system_cache = SystemDataCache()
+    return _system_cache
 
 
 # ============================================================================
@@ -280,6 +332,8 @@ class IOCScanner:
         
         encrypted_files = []
         for root in search_roots:
+            if len(encrypted_files) >= 500:  # global cap across all roots
+                break
             try:
                 for dirpath, _, filenames in os.walk(root, followlinks=False):
                     for fname in filenames:
@@ -287,7 +341,7 @@ class IOCScanner:
                             fpath = os.path.join(dirpath, fname)
                             stat_info = safe_stat(fpath)
                             encrypted_files.append(stat_info or {"path": fpath})
-                            if len(encrypted_files) >= 500:  # cap for performance
+                            if len(encrypted_files) >= 500:
                                 break
                     if len(encrypted_files) >= 500:
                         break
@@ -400,7 +454,7 @@ class IOCScanner:
                         fpath = os.path.join(dirpath, fname)
                         try:
                             fsize = os.path.getsize(fpath)
-                            if fsize > 100_000_000 or fsize < 1000:  # skip very large/tiny
+                            if fsize > 100_000_000 or fsize < 100:  # skip very large/tiny
                                 continue
                         except OSError:
                             continue
@@ -561,6 +615,40 @@ class PersistenceHunter:
                     evidence={"tasks": suspicious_tasks[:30]},
                 ))
         
+        # --- WMI Event Subscriptions (common Nova persistence) ---
+        wmi_queries = [
+            ("EventConsumer", 'wmic /namespace:"\\\\root\\subscription" path __EventConsumer get Name,__CLASS /format:csv 2>nul'),
+            ("EventFilter", 'wmic /namespace:"\\\\root\\subscription" path __EventFilter get Name,Query /format:csv 2>nul'),
+            ("FilterToConsumerBinding", 'wmic /namespace:"\\\\root\\subscription" path __FilterToConsumerBinding get Consumer,Filter /format:csv 2>nul'),
+        ]
+        wmi_persist = []
+        for wmi_name, wmi_cmd in wmi_queries:
+            out, _, rc = run_cmd(wmi_cmd, timeout=15)
+            if rc == 0 and out:
+                lines = [l.strip() for l in out.split("\n") if l.strip() and not l.startswith("Node")]
+                if lines:
+                    wmi_persist.append({"type": wmi_name, "entries": lines[:20]})
+
+        if wmi_persist:
+            self.findings.append(Finding(
+                self.MODULE,
+                "WMI EVENT SUBSCRIPTION PERSISTENCE",
+                f"Found WMI persistence subscriptions - commonly used by ransomware affiliates",
+                severity=5, mitre_id="T1546",
+                evidence={"wmi_subscriptions": wmi_persist},
+            ))
+
+        # --- BITS Transfer Jobs ---
+        out, _, rc = run_cmd("bitsadmin /list /allusers /verbose 2>nul", timeout=15)
+        if rc == 0 and out and "GUID" in out:
+            self.findings.append(Finding(
+                self.MODULE,
+                "BITS TRANSFER JOBS FOUND",
+                "Active BITS jobs detected - can be used for persistence and data exfiltration",
+                severity=3, mitre_id="T1197",
+                evidence={"bits_output": out[:5000]},
+            ))
+
         # --- New/Modified Services ---
         out, _, rc = run_cmd(
             'wmic service where "StartMode=\'Auto\'" get Name,PathName,StartName /format:csv 2>nul',
@@ -678,7 +766,7 @@ class PersistenceHunter:
                     # Flag recently modified profiles
                     try:
                         mtime = os.path.getmtime(pf)
-                        if (datetime.now().timestamp() - mtime) < 7 * 86400:  # last 7 days
+                        if (datetime.now(timezone.utc).timestamp() - mtime) < 7 * 86400:  # last 7 days
                             suspicious.append({
                                 "type": "recently_modified_profile",
                                 "details": stat,
@@ -849,8 +937,8 @@ class LateralMovementDetector:
             timeout=30
         )
         if rc == 0 and out:
-            type3_count = out.lower().count("logon type:		3")
-            type10_count = out.lower().count("logon type:		10")
+            type3_count = len(re.findall(r'logon type:\s+3\b', out, re.I))
+            type10_count = len(re.findall(r'logon type:\s+10\b', out, re.I))
             if type3_count > 0 or type10_count > 0:
                 self.findings.append(Finding(
                     self.MODULE, "NETWORK/RDP LOGON EVENTS",
@@ -960,16 +1048,12 @@ class ExfiltrationDetector:
     def check_exfil_tools(self) -> List[Finding]:
         """Check for exfiltration tools in running processes."""
         self.logger.info("[EXFIL] Checking for data exfiltration indicators...")
-        os_type = get_os_type()
-        
+
         exfil_tools = ["rclone", "megasync", "winscp", "filezilla", "cyberduck",
                         "7z", "7za", "rar", "tar", "zip",  # archiving for staging
                         "curl", "wget", "scp", "rsync", "ftp"]
-        
-        if os_type == "windows":
-            out, _, _ = run_cmd("tasklist /fo csv 2>nul")
-        else:
-            out, _, _ = run_cmd("ps aux 2>/dev/null")
+
+        out = get_system_cache().get_process_list()
         
         found = []
         if out:
@@ -1080,12 +1164,8 @@ class ExfiltrationDetector:
     def check_outbound_connections(self) -> List[Finding]:
         """Analyze current outbound connections for suspicious destinations."""
         self.logger.info("[EXFIL] Checking outbound network connections...")
-        os_type = get_os_type()
-        
-        if os_type == "windows":
-            out, _, _ = run_cmd("netstat -naob 2>nul", timeout=15)
-        else:
-            out, _, _ = run_cmd("ss -tunap 2>/dev/null || netstat -tunap 2>/dev/null", timeout=15)
+
+        out = get_system_cache().get_netstat_output()
         
         if out:
             # Look for connections on unusual ports
@@ -1169,15 +1249,24 @@ class DefenseEvasionDetector:
                 pass
         
         # --- Shadow copies deleted? ---
-        out, _, rc = run_cmd("vssadmin list shadows 2>nul")
+        out, err, rc = run_cmd("vssadmin list shadows 2>nul")
         if rc == 0:
-            if "no items" in out.lower() or "no shadow" in out.lower() or not out.strip():
+            if "no items" in out.lower() or "no shadow" in out.lower():
                 self.findings.append(Finding(
                     self.MODULE,
                     "NO VOLUME SHADOW COPIES (BACKUP DESTRUCTION)",
                     "All VSS shadow copies appear deleted - typical ransomware behavior",
                     severity=5, mitre_id="T1490",
                     evidence={"vss_output": out},
+                ))
+            elif not out.strip():
+                # Empty output with rc=0 is ambiguous — could be permission or parsing issue
+                self.findings.append(Finding(
+                    self.MODULE,
+                    "VSS CHECK INCONCLUSIVE",
+                    "vssadmin returned empty output - verify manually (may require elevation)",
+                    severity=3, mitre_id="T1490",
+                    evidence={"vss_output": out, "stderr": err},
                 ))
         
         # --- Windows event log clearing ---
@@ -1385,6 +1474,360 @@ class DefenseEvasionDetector:
 
 
 # ============================================================================
+# MODULE 5b: CREDENTIAL & ARTIFACT HUNTER
+# ============================================================================
+
+class CredentialArtifactHunter:
+    """Detect credential dumping artifacts and attacker command history."""
+
+    MODULE = "CREDENTIAL_ARTIFACTS"
+
+    def __init__(self, logger: logging.Logger):
+        self.logger = logger
+        self.findings: List[Finding] = []
+
+    def check_credential_dumps(self) -> List[Finding]:
+        """Detect LSASS dumps, SAM/SYSTEM hive copies, and other credential artifacts."""
+        self.logger.info("[CRED] Checking for credential dumping artifacts...")
+        os_type = get_os_type()
+
+        if os_type == "windows":
+            cred_artifacts = []
+
+            # LSASS memory dump files
+            lsass_patterns = ["lsass*.dmp", "lsass*.zip", "lsass*.rar"]
+            dump_dirs = [
+                os.path.expandvars(r"%TEMP%"),
+                os.path.expandvars(r"%PROGRAMDATA%"),
+                r"C:\PerfLogs",
+                r"C:\Windows\Temp",
+                os.path.expandvars(r"%USERPROFILE%\Desktop"),
+                os.path.expandvars(r"%USERPROFILE%\Documents"),
+            ]
+            for ddir in dump_dirs:
+                if not os.path.exists(ddir):
+                    continue
+                for pattern in lsass_patterns:
+                    for fpath in glob.glob(os.path.join(ddir, pattern)):
+                        stat = safe_stat(fpath)
+                        if stat:
+                            cred_artifacts.append({"type": "lsass_dump", **stat})
+
+            # SAM / SYSTEM / SECURITY hive copies
+            hive_names = ["sam", "system", "security", "ntds.dit"]
+            for ddir in dump_dirs:
+                if not os.path.exists(ddir):
+                    continue
+                try:
+                    for fname in os.listdir(ddir):
+                        if fname.lower() in hive_names:
+                            fpath = os.path.join(ddir, fname)
+                            stat = safe_stat(fpath)
+                            if stat:
+                                cred_artifacts.append({"type": "hive_copy", "hive": fname, **stat})
+                except (PermissionError, OSError):
+                    continue
+
+            # Procdump artifacts
+            for ddir in dump_dirs:
+                if not os.path.exists(ddir):
+                    continue
+                for fpath in glob.glob(os.path.join(ddir, "procdump*.exe")):
+                    stat = safe_stat(fpath)
+                    if stat:
+                        cred_artifacts.append({"type": "procdump_binary", **stat})
+
+            # comsvcs.dll minidump via rundll32 (check recent PowerShell history for this)
+            # This is handled in check_powershell_history below
+
+            if cred_artifacts:
+                self.findings.append(Finding(
+                    self.MODULE,
+                    "CREDENTIAL DUMP ARTIFACTS DETECTED",
+                    f"Found {len(cred_artifacts)} credential dumping artifacts (LSASS dumps, hive copies)",
+                    severity=5, mitre_id="T1003",
+                    evidence={"artifacts": cred_artifacts},
+                ))
+
+        elif os_type == "linux":
+            cred_artifacts = []
+            # /etc/shadow copies in unusual locations
+            shadow_locs = ["/tmp", "/var/tmp", "/dev/shm", "/opt"]
+            for loc in shadow_locs:
+                shadow_path = os.path.join(loc, "shadow")
+                if os.path.exists(shadow_path):
+                    stat = safe_stat(shadow_path)
+                    if stat:
+                        cred_artifacts.append({"type": "shadow_copy", **stat})
+                # Also check for common dump tool outputs
+                for pattern in ["*.dmp", "hashdump*", "mimipenguin*"]:
+                    for fpath in glob.glob(os.path.join(loc, pattern)):
+                        stat = safe_stat(fpath)
+                        if stat:
+                            cred_artifacts.append({"type": "dump_file", **stat})
+
+            if cred_artifacts:
+                self.findings.append(Finding(
+                    self.MODULE,
+                    "CREDENTIAL DUMP ARTIFACTS DETECTED",
+                    f"Found {len(cred_artifacts)} credential-related artifacts in temp locations",
+                    severity=5, mitre_id="T1003",
+                    evidence={"artifacts": cred_artifacts},
+                ))
+
+        return self.findings
+
+    def check_powershell_history(self) -> List[Finding]:
+        """Check PowerShell ConsoleHost_history.txt for attacker commands."""
+        self.logger.info("[CRED] Checking PowerShell command history...")
+        os_type = get_os_type()
+
+        if os_type != "windows":
+            return self.findings
+
+        # ConsoleHost_history.txt for all users
+        ps_history_base = os.path.expandvars(
+            r"%APPDATA%\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt"
+        )
+        history_files = [ps_history_base]
+        # Also check other user profiles
+        users_dir = os.path.expandvars(r"%SYSTEMDRIVE%\Users")
+        if os.path.exists(users_dir):
+            try:
+                for user_dir in os.listdir(users_dir):
+                    hist = os.path.join(
+                        users_dir, user_dir,
+                        r"AppData\Roaming\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt"
+                    )
+                    if os.path.exists(hist) and hist not in history_files:
+                        history_files.append(hist)
+            except (PermissionError, OSError):
+                pass
+
+        suspicious_patterns = [
+            r"invoke-mimikatz", r"invoke-expression", r"downloadstring",
+            r"encodedcommand", r"set-mppreference", r"-disablerealtimemonitoring",
+            r"vssadmin\s+delete", r"wmic\s+shadowcopy", r"comsvcs\.dll",
+            r"sekurlsa", r"lsadump", r"procdump.*lsass",
+            r"reg\s+save.*\\sam", r"reg\s+save.*\\system", r"reg\s+save.*\\security",
+            r"ntdsutil", r"rclone", r"megasync",
+            r"net\s+user\s+.*\/add", r"net\s+localgroup\s+admin",
+        ]
+
+        for hist_file in history_files:
+            if not os.path.exists(hist_file):
+                continue
+            try:
+                with open(hist_file, "r", errors="ignore") as f:
+                    lines = f.readlines()
+                    suspicious_cmds = []
+                    for line in lines[-500:]:
+                        for pat in suspicious_patterns:
+                            if re.search(pat, line, re.I):
+                                suspicious_cmds.append(line.strip())
+                                break
+                    if suspicious_cmds:
+                        self.findings.append(Finding(
+                            self.MODULE,
+                            "SUSPICIOUS POWERSHELL HISTORY",
+                            f"Found {len(suspicious_cmds)} suspicious commands in {hist_file}",
+                            severity=5, mitre_id="T1059",
+                            evidence={"history_file": hist_file, "commands": suspicious_cmds[:100]},
+                        ))
+            except (PermissionError, OSError):
+                continue
+
+        return self.findings
+
+    def check_proc_analysis(self) -> List[Finding]:
+        """Linux: check /proc for hidden/deleted binaries and process injection."""
+        self.logger.info("[CRED] Checking /proc for hidden/deleted malware...")
+        os_type = get_os_type()
+
+        if os_type != "linux":
+            return self.findings
+
+        suspicious_procs = []
+        try:
+            for pid_dir in os.listdir("/proc"):
+                if not pid_dir.isdigit():
+                    continue
+                exe_link = f"/proc/{pid_dir}/exe"
+                try:
+                    exe_path = os.readlink(exe_link)
+                    # Detect deleted binaries still running in memory
+                    if "(deleted)" in exe_path:
+                        cmdline_path = f"/proc/{pid_dir}/cmdline"
+                        cmdline = ""
+                        try:
+                            with open(cmdline_path, "r") as f:
+                                cmdline = f.read().replace("\x00", " ").strip()
+                        except (PermissionError, OSError):
+                            pass
+                        suspicious_procs.append({
+                            "pid": pid_dir,
+                            "exe": exe_path,
+                            "cmdline": cmdline,
+                            "issue": "Binary deleted from disk but still running",
+                        })
+                    # Detect execution from suspicious locations
+                    elif any(loc in exe_path for loc in ["/tmp/", "/dev/shm/", "/var/tmp/"]):
+                        cmdline_path = f"/proc/{pid_dir}/cmdline"
+                        cmdline = ""
+                        try:
+                            with open(cmdline_path, "r") as f:
+                                cmdline = f.read().replace("\x00", " ").strip()
+                        except (PermissionError, OSError):
+                            pass
+                        suspicious_procs.append({
+                            "pid": pid_dir,
+                            "exe": exe_path,
+                            "cmdline": cmdline,
+                            "issue": "Running from suspicious temp location",
+                        })
+                except (PermissionError, OSError, FileNotFoundError):
+                    continue
+        except (PermissionError, OSError):
+            pass
+
+        if suspicious_procs:
+            self.findings.append(Finding(
+                self.MODULE,
+                "SUSPICIOUS PROCESSES IN /proc",
+                f"Found {len(suspicious_procs)} processes with deleted binaries or running from temp dirs",
+                severity=5, mitre_id="T1055",
+                evidence={"processes": suspicious_procs},
+            ))
+
+        return self.findings
+
+    def check_user_accounts(self) -> List[Finding]:
+        """Cross-platform check for recently created or suspicious user accounts."""
+        self.logger.info("[CRED] Checking for suspicious user accounts...")
+        os_type = get_os_type()
+        suspicious_users = []
+
+        if os_type == "windows":
+            out, _, rc = run_cmd(
+                'wmic useraccount get Name,SID,Status,Disabled,LocalAccount /format:csv 2>nul',
+                timeout=15
+            )
+            if rc == 0 and out:
+                # Also check for recently created accounts via net user
+                out2, _, rc2 = run_cmd('net user 2>nul')
+                if rc2 == 0 and out2:
+                    suspicious_users.append({"type": "user_list", "output": out2[:3000]})
+
+        elif os_type == "linux":
+            # Check for users with UID >= 1000 or UID 0 (root equivalents)
+            try:
+                with open("/etc/passwd", "r") as f:
+                    for line in f:
+                        parts = line.strip().split(":")
+                        if len(parts) >= 7:
+                            username, uid, shell = parts[0], int(parts[2]), parts[6]
+                            # Root-equivalent accounts (UID 0 that aren't root)
+                            if uid == 0 and username != "root":
+                                suspicious_users.append({
+                                    "type": "root_equivalent",
+                                    "username": username,
+                                    "uid": uid,
+                                    "shell": shell,
+                                })
+                            # Users with login shells added recently
+                            if uid >= 1000 and shell in ["/bin/bash", "/bin/sh", "/bin/zsh"]:
+                                home = parts[5]
+                                if os.path.exists(home):
+                                    try:
+                                        mtime = os.path.getmtime(home)
+                                        if (datetime.now(timezone.utc).timestamp() - mtime) < 30 * 86400:
+                                            suspicious_users.append({
+                                                "type": "recent_user",
+                                                "username": username,
+                                                "uid": uid,
+                                                "home": home,
+                                                "shell": shell,
+                                                "home_modified": datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat(),
+                                            })
+                                    except OSError:
+                                        pass
+            except (PermissionError, OSError):
+                pass
+
+        elif os_type == "macos":
+            out, _, rc = run_cmd("dscl . list /Users UniqueID 2>/dev/null")
+            if rc == 0 and out:
+                for line in out.split("\n"):
+                    parts = line.split()
+                    if len(parts) == 2:
+                        username, uid = parts[0], int(parts[1])
+                        if uid >= 500 and not username.startswith("_"):
+                            suspicious_users.append({
+                                "type": "local_user",
+                                "username": username,
+                                "uid": uid,
+                            })
+
+        if suspicious_users:
+            sev = 5 if any(u.get("type") == "root_equivalent" for u in suspicious_users) else 3
+            self.findings.append(Finding(
+                self.MODULE,
+                "USER ACCOUNT ANOMALIES",
+                f"Found {len(suspicious_users)} user account entries to investigate",
+                severity=sev, mitre_id="T1136",
+                evidence={"users": suspicious_users},
+            ))
+
+        return self.findings
+
+    def check_network_recon(self) -> List[Finding]:
+        """Capture ARP table and routing table for lateral movement path analysis."""
+        self.logger.info("[CRED] Capturing network reconnaissance data...")
+        os_type = get_os_type()
+        recon_data = {}
+
+        if os_type == "windows":
+            out, _, rc = run_cmd("arp -a 2>nul")
+            if rc == 0 and out:
+                recon_data["arp_table"] = out[:5000]
+            out, _, rc = run_cmd("route print 2>nul")
+            if rc == 0 and out:
+                recon_data["routing_table"] = out[:5000]
+            out, _, rc = run_cmd("ipconfig /all 2>nul")
+            if rc == 0 and out:
+                recon_data["network_config"] = out[:5000]
+        else:
+            out, _, rc = run_cmd("arp -a 2>/dev/null || ip neigh 2>/dev/null")
+            if rc == 0 and out:
+                recon_data["arp_table"] = out[:5000]
+            out, _, rc = run_cmd("ip route 2>/dev/null || route -n 2>/dev/null || netstat -rn 2>/dev/null")
+            if rc == 0 and out:
+                recon_data["routing_table"] = out[:5000]
+            out, _, rc = run_cmd("ip addr 2>/dev/null || ifconfig -a 2>/dev/null")
+            if rc == 0 and out:
+                recon_data["network_config"] = out[:5000]
+
+        if recon_data:
+            self.findings.append(Finding(
+                self.MODULE,
+                "NETWORK RECONNAISSANCE DATA",
+                "Captured ARP, routing, and network config for lateral movement analysis",
+                severity=1, mitre_id="T1018",
+                evidence=recon_data,
+            ))
+
+        return self.findings
+
+    def run_all(self) -> List[Finding]:
+        self.check_credential_dumps()
+        self.check_powershell_history()
+        self.check_proc_analysis()
+        self.check_user_accounts()
+        self.check_network_recon()
+        return self.findings
+
+
+# ============================================================================
 # MODULE 6: LIVE TRIAGE
 # ============================================================================
 
@@ -1411,10 +1854,7 @@ class LiveTriage:
         triage_data["current_users"] = out
         
         # --- Suspicious Processes ---
-        if os_type == "windows":
-            out, _, _ = run_cmd("tasklist /v /fo csv 2>nul")
-        else:
-            out, _, _ = run_cmd("ps auxww 2>/dev/null")
+        out = get_system_cache().get_process_list()
         
         suspicious_procs = []
         if out:
@@ -1436,10 +1876,7 @@ class LiveTriage:
         triage_data["process_list_preview"] = out[:5000] if out else ""
         
         # --- Network Connections ---
-        if os_type == "windows":
-            out, _, _ = run_cmd("netstat -naob 2>nul", timeout=15)
-        else:
-            out, _, _ = run_cmd("ss -tunap 2>/dev/null || netstat -tunap 2>/dev/null", timeout=15)
+        out = get_system_cache().get_netstat_output()
         triage_data["network_connections"] = out[:5000] if out else ""
         
         # --- Listening Ports ---
@@ -1741,8 +2178,8 @@ def main():
     ║       NOVA / RALord RANSOMWARE - IR & THREAT HUNTING TOOLKIT   ║
     ║                                                                ║
     ║  Modules: IOC Scanner | Persistence | Lateral Movement         ║
-    ║           Exfiltration | Defense Evasion | Live Triage          ║
-    ║           Timeline Builder                                     ║
+    ║           Exfiltration | Defense Evasion | Credential Artifacts ║
+    ║           Live Triage | Timeline Builder                       ║
     ║                                                                ║
     ║  ⚠  RUN AS ADMINISTRATOR / ROOT FOR FULL VISIBILITY  ⚠        ║
     ╚══════════════════════════════════════════════════════════════════╝
@@ -1753,7 +2190,7 @@ def main():
     parser.add_argument("--output-dir", "-o", default=None,
                         help="Output directory for reports")
     parser.add_argument("--modules", "-m", default="all",
-                        help="Comma-separated modules: ioc,persistence,lateral,exfil,evasion,triage,timeline (or 'all')")
+                        help="Comma-separated modules: ioc,persistence,lateral,exfil,evasion,creds,triage,timeline (or 'all')")
     parser.add_argument("--quick", "-q", action="store_true",
                         help="Quick triage mode (IOC + Triage only)")
     args = parser.parse_args()
@@ -1768,6 +2205,10 @@ def main():
     os.makedirs(output_dir, exist_ok=True)
     logger = setup_logging(output_dir)
     
+    # Initialize shared system data cache to avoid duplicate expensive commands
+    global _system_cache
+    _system_cache = SystemDataCache()
+
     logger.info(f"Nova IR Toolkit started on {socket.gethostname()} ({platform.platform()})")
     logger.info(f"Output directory: {output_dir}")
     
@@ -1775,7 +2216,7 @@ def main():
     if args.quick:
         modules = {"ioc", "triage"}
     elif args.modules == "all":
-        modules = {"ioc", "persistence", "lateral", "exfil", "evasion", "triage"}
+        modules = {"ioc", "persistence", "lateral", "exfil", "evasion", "creds", "triage"}
     else:
         modules = set(args.modules.lower().split(","))
     
@@ -1817,6 +2258,13 @@ def main():
         evasion = DefenseEvasionDetector(logger)
         all_findings.extend(evasion.run_all())
     
+    if "creds" in modules:
+        logger.info("=" * 60)
+        logger.info("MODULE 5b: CREDENTIAL & ARTIFACT HUNTER")
+        logger.info("=" * 60)
+        creds = CredentialArtifactHunter(logger)
+        all_findings.extend(creds.run_all())
+
     if "triage" in modules:
         logger.info("=" * 60)
         logger.info("MODULE 6: LIVE TRIAGE")
