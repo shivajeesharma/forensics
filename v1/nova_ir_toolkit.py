@@ -69,10 +69,16 @@ NOVA_IOCS = {
         "456b9adaabae9f3dce2207aa71410987f0a571cd8c11f2e7b41468501a863606",
     ],
     "md5_hashes": [
-        "be15f62d14d1cbe2aecce8396f4c6289",
+        "be15f62d14d1cbe2aecce8396f4c6289",   # Primary Nova payload
+        "ef846baabc14fe461cff4c4a0fd5056f",    # RALord-era payload variant
+        "4566f5ba6d1a1db0dd7794ea8d791b3f",    # Nova dropper component
+        "4924b945cfdc5bfece03f5140a546384",    # Nova encryptor module
     ],
     "file_extensions": [
-        ".ralord",
+        ".ralord",   # Primary extension (RALord era)
+        ".nova",     # Used by some Nova affiliates
+        ".LORD",     # Alternate RALord extension (case-sensitive)
+        ".RNOVA",    # Seen in recent Nova campaigns
     ],
     "ransom_note_names": [
         "README.txt",
@@ -81,21 +87,40 @@ NOVA_IOCS = {
         "RESTORE_FILES.txt",
         "!README!.txt",
     ],
+    # Pattern: README-<12_random_alphanum>.txt (e.g. README-a8b3f1c9e2d4.txt)
+    "ransom_note_pattern": r"^README-[A-Za-z0-9]{8,14}\.txt$",
     "ransom_note_keywords": [
         "nova", "ralord", "qtox", "tox id", "your files have been encrypted",
-        "data has been stolen", "onion", "novavdivko2zvtrvtllnq45lxhba2rfzp76qigb4nrliklem5au7czqd",
+        "data has been stolen", "onion", "session messenger", "jabber",
+        "novavdivko2zvtrvtllnq45lxhba2rfzp76qigb4nrliklem5au7czqd",
         "pifk3xu3vad6cuxsjll4qjomyaaaoyvnyqppro75pazadzctrrvpdnyd",
         "novadmrkp4vbk2padk5t6pb",
+        "ralordt7gywtkkkkq2suldao6mpibsb7cpjvdfezpzwgltyj2laiuuid",
+        "ralordqe33mpufkpsr6zkdatktlu3t2uei4ught3sitxgtzfmqmbsuyd",
     ],
     "tox_ids": [
         "8E9A6195A769FE7115F087C61D75CF32874C339B3AB0947D07480C9A8A12DA5009151BE6A51F",
+        "0C8E5B45C57AE244E9C904C5BC74F73306937469D9CEA22541CA69AC162B8D42A20F4C0382AC",
     ],
     "session_tokens": [
         "054f55ec93aca9bac362b9d91eff36a7ce451e7caba47c0b2e004ba429f9529c79",
     ],
     "onion_domains": [
+        # Nova-era domains
         "novavdivko2zvtrvtllnq45lxhba2rfzp76qigb4nrliklem5au7czqd.onion",
         "pifk3xu3vad6cuxsjll4qjomyaaaoyvnyqppro75pazadzctrrvpdnyd.onion",
+        "novadmrkp4vbk2padk5t6pbxolndceuc7hrcq4mjaoyed6nxsqiuzyyd.onion",
+        "novav75eqkjoxct7xuhhwnjw5uaaxvznhtbykq6zal5x7tfevxzjyqyd.onion",
+        "novavagygnhqyf7a5tgbuvmujve5a2jzgbrq2n4dvetkhvr2zjg27cad.onion",
+        # RALord-era domains (still operational)
+        "ralordt7gywtkkkkq2suldao6mpibsb7cpjvdfezpzwgltyj2laiuuid.onion",
+        "ralord3htj7v2dkavss2hjzviviwgsf4anfdnihn5qcjl6eb5if3cuqd.onion",
+        "ralordqe33mpufkpsr6zkdatktlu3t2uei4ught3sitxgtzfmqmbsuyd.onion",
+    ],
+    # Suspected C2 infrastructure IPs
+    "c2_ips": [
+        "144.172.92.192",
+        "144.172.95.78",
     ],
     # Common tools used by Nova affiliates (dual-use / LOLBins)
     "suspicious_tools": [
@@ -148,6 +173,20 @@ MITRE_MAPPING = {
     "T1546": "Event Triggered Execution - WMI event subscriptions",
     "T1547": "Boot or Logon Autostart Execution - Registry run keys",
     "T1074": "Data Staged - Archives staged for exfiltration",
+    "T1133": "External Remote Services - Exposed VPN/RDP/Citrix for initial access",
+    "T1204": "User Execution - User opens malicious attachment/link",
+    "T1106": "Native API - Direct Windows API calls to bypass security hooks",
+    "T1068": "Exploitation for Privilege Escalation - Kernel/software exploit for SYSTEM",
+    "T1027": "Obfuscated Files or Information - Packed/encrypted payloads",
+    "T1497": "Virtualization/Sandbox Evasion - Anti-VM/anti-sandbox checks",
+    "T1082": "System Information Discovery - Enumerating OS, hardware, domain",
+    "T1012": "Query Registry - Reading registry for config/credential data",
+    "T1550": "Use Alternate Authentication Material - Pass-the-hash/pass-the-ticket",
+    "T1005": "Data from Local System - Collecting files for exfiltration",
+    "T1071": "Application Layer Protocol - C2 over HTTP/HTTPS/DNS",
+    "T1491": "Defacement - Desktop wallpaper changed to ransom message",
+    "T1070": "Indicator Removal - Log clearing and anti-forensics",
+    "T1543": "Create or Modify System Process - Persistence via services",
 }
 
 
@@ -315,10 +354,14 @@ class IOCScanner:
         self.findings: List[Finding] = []
     
     def scan_encrypted_files(self) -> List[Finding]:
-        """Find files with .ralord extension."""
-        self.logger.info("[IOC] Scanning for .ralord encrypted files...")
+        """Find files with Nova/RALord encryption extensions."""
+        extensions = NOVA_IOCS["file_extensions"]
+        ext_list = ", ".join(extensions)
+        self.logger.info(f"[IOC] Scanning for encrypted files with extensions: {ext_list}")
+        self.logger.info("  WHY: Nova/RALord appends these extensions to files after encryption.")
+        self.logger.info("       Finding these confirms active encryption on this host.")
         os_type = get_os_type()
-        
+
         if os_type == "windows":
             drives = []
             for letter in "CDEFGHIJKLMNOPQRSTUVWXYZ":
@@ -329,61 +372,75 @@ class IOCScanner:
             search_roots = ["/Users", "/Volumes", "/tmp", "/var"]
         else:  # linux
             search_roots = ["/home", "/tmp", "/var", "/opt", "/srv", "/root"]
-        
+
         encrypted_files = []
+        ext_set = set(e.lower() for e in extensions)
         for root in search_roots:
             if len(encrypted_files) >= 500:  # global cap across all roots
                 break
             try:
                 for dirpath, _, filenames in os.walk(root, followlinks=False):
                     for fname in filenames:
-                        if fname.endswith(".ralord"):
+                        # Check against all known Nova encrypted file extensions
+                        _, fext = os.path.splitext(fname)
+                        if fext.lower() in ext_set:
                             fpath = os.path.join(dirpath, fname)
                             stat_info = safe_stat(fpath)
-                            encrypted_files.append(stat_info or {"path": fpath})
+                            entry = stat_info or {"path": fpath}
+                            entry["extension"] = fext
+                            encrypted_files.append(entry)
                             if len(encrypted_files) >= 500:
                                 break
                     if len(encrypted_files) >= 500:
                         break
             except (PermissionError, OSError):
                 continue
-        
+
         if encrypted_files:
             f = Finding(
                 self.MODULE,
-                "ENCRYPTED FILES DETECTED (.ralord)",
-                f"Found {len(encrypted_files)} files encrypted by Nova/RALord ransomware",
+                "ENCRYPTED FILES DETECTED",
+                f"Found {len(encrypted_files)} files encrypted by Nova/RALord ransomware (extensions: {ext_list})",
                 severity=5,
                 mitre_id="T1486",
                 evidence={"encrypted_files": encrypted_files[:100], "total_count": len(encrypted_files)},
             )
             self.findings.append(f)
-            self.logger.critical(f"[IOC] CRITICAL: Found {len(encrypted_files)} .ralord encrypted files!")
+            self.logger.critical(f"[IOC] CRITICAL: Found {len(encrypted_files)} encrypted files!")
         else:
-            self.logger.info("[IOC] No .ralord encrypted files found.")
-        
+            self.logger.info(f"[IOC] No encrypted files found with extensions: {ext_list}")
+
         return self.findings
     
     def scan_ransom_notes(self) -> List[Finding]:
-        """Find ransom notes by name and keyword content."""
-        self.logger.info("[IOC] Scanning for ransom notes...")
+        """Find ransom notes by name, pattern, and keyword content."""
+        note_names = NOVA_IOCS["ransom_note_names"]
+        note_pattern = NOVA_IOCS.get("ransom_note_pattern", "")
+        self.logger.info(f"[IOC] Scanning for ransom notes matching: {', '.join(note_names)}")
+        self.logger.info(f"  ALSO: Pattern-matching README-<random>.txt (Nova's randomized naming)")
+        self.logger.info("  WHY: Nova drops ransom notes in every encrypted directory. Finding these")
+        self.logger.info("       confirms the ransomware ran, and note content reveals the threat actor,")
+        self.logger.info("       their Tox ID, onion domains, and negotiation terms.")
         os_type = get_os_type()
-        
+
         if os_type == "windows":
             search_roots = ["C:\\Users", "C:\\"]
         elif os_type == "macos":
             search_roots = ["/Users", "/tmp"]
         else:
             search_roots = ["/home", "/tmp", "/root", "/var"]
-        
+
+        note_pattern_re = re.compile(note_pattern) if note_pattern else None
         found_notes = []
         for root in search_roots:
             try:
                 for dirpath, _, filenames in os.walk(root, followlinks=False):
                     for fname in filenames:
-                        if fname in NOVA_IOCS["ransom_note_names"]:
+                        matched_name = fname in note_names
+                        matched_pattern = bool(note_pattern_re and note_pattern_re.match(fname))
+                        if matched_name or matched_pattern:
                             fpath = os.path.join(dirpath, fname)
-                            note_info = {"path": fpath, "matched_by": "filename"}
+                            note_info = {"path": fpath, "matched_by": "pattern" if matched_pattern else "filename"}
                             # Check content for Nova-specific keywords
                             try:
                                 with open(fpath, "r", errors="ignore") as nf:
@@ -392,7 +449,7 @@ class IOCScanner:
                                     if matched_kw:
                                         note_info["matched_keywords"] = matched_kw
                                         note_info["confirmed_nova"] = True
-                                        note_info["matched_by"] = "filename+content"
+                                        note_info["matched_by"] += "+content"
                             except (PermissionError, OSError):
                                 pass
                             found_notes.append(note_info)
@@ -416,7 +473,9 @@ class IOCScanner:
     
     def scan_known_hashes(self, scan_dirs: Optional[List[str]] = None) -> List[Finding]:
         """Scan common directories for files matching known Nova hashes."""
-        self.logger.info("[IOC] Scanning for known malware hashes...")
+        self.logger.info(f"[IOC] Scanning for known malware hashes ({len(NOVA_IOCS['sha256_hashes'])} SHA256, {len(NOVA_IOCS['md5_hashes'])} MD5)")
+        self.logger.info("  WHY: These are confirmed Nova/RALord ransomware binaries, droppers, and")
+        self.logger.info("       encryptor modules. A hash match is definitive proof of the malware.")
         os_type = get_os_type()
         
         if scan_dirs is None:
@@ -486,7 +545,12 @@ class IOCScanner:
     
     def scan_suspicious_tools(self) -> List[Finding]:
         """Find known attacker tools on disk."""
-        self.logger.info("[IOC] Scanning for suspicious/dual-use tools...")
+        self.logger.info(f"[IOC] Scanning for {len(NOVA_IOCS['suspicious_tools'])} known attacker/dual-use tools on disk")
+        self.logger.info("  SEARCHING: rclone, PsExec, mimikatz, LaZagne, SharpHound, BloodHound,")
+        self.logger.info("             AnyDesk, Chisel, ngrok, MegaSync, WinSCP, netscan, etc.")
+        self.logger.info("  WHY: Nova affiliates deploy these tools for credential theft (mimikatz),")
+        self.logger.info("       data exfiltration (rclone, MegaSync), lateral movement (PsExec),")
+        self.logger.info("       network recon (netscan), and tunneling (chisel, ngrok).")
         os_type = get_os_type()
         
         if os_type == "windows":
@@ -560,6 +624,10 @@ class PersistenceHunter:
     def check_windows_persistence(self) -> List[Finding]:
         """Check Windows registry run keys, services, scheduled tasks."""
         self.logger.info("[PERSIST] Checking Windows persistence mechanisms...")
+        self.logger.info("  SEARCHING: Registry Run/RunOnce keys, scheduled tasks, WMI event subscriptions,")
+        self.logger.info("             BITS transfer jobs, auto-start services")
+        self.logger.info("  WHY: Nova affiliates establish persistence to survive reboots and maintain")
+        self.logger.info("       access. WMI subscriptions and BITS jobs are stealthy methods often missed.")
         
         # --- Registry Run Keys ---
         reg_paths = [
@@ -675,6 +743,10 @@ class PersistenceHunter:
     def check_linux_persistence(self) -> List[Finding]:
         """Check cron, systemd, rc.local, profile scripts, authorized_keys."""
         self.logger.info("[PERSIST] Checking Linux persistence mechanisms...")
+        self.logger.info("  SEARCHING: cron jobs, systemd units, rc.local, SSH authorized_keys,")
+        self.logger.info("             profile scripts (.bashrc, .profile, .bash_profile)")
+        self.logger.info("  WHY: Nova Linux/ESXi payloads use cron and systemd for persistence.")
+        self.logger.info("       Attacker SSH keys in authorized_keys provide backdoor re-entry.")
         
         suspicious = []
         
@@ -788,6 +860,8 @@ class PersistenceHunter:
     def check_macos_persistence(self) -> List[Finding]:
         """Check LaunchAgents, LaunchDaemons, login items."""
         self.logger.info("[PERSIST] Checking macOS persistence mechanisms...")
+        self.logger.info("  SEARCHING: LaunchAgents, LaunchDaemons, login items")
+        self.logger.info("  WHY: Non-Apple plists in launch directories can indicate malware persistence.")
         
         suspicious = []
         
@@ -858,6 +932,10 @@ class LateralMovementDetector:
     
     def check_windows_lateral(self) -> List[Finding]:
         self.logger.info("[LATERAL] Checking Windows lateral movement artifacts...")
+        self.logger.info("  SEARCHING: RDP sessions (inbound/outbound), SMB/admin share connections,")
+        self.logger.info("             WMI remote execution, PsExec service/binary, logon events (Type 3/10)")
+        self.logger.info("  WHY: Nova affiliates move laterally via RDP, PsExec, and WMI to reach domain")
+        self.logger.info("       controllers and file servers before deploying the ransomware payload.")
         
         # --- RDP Connections (Inbound) ---
         out, _, rc = run_cmd(
@@ -952,6 +1030,8 @@ class LateralMovementDetector:
     
     def check_linux_lateral(self) -> List[Finding]:
         self.logger.info("[LATERAL] Checking Linux lateral movement artifacts...")
+        self.logger.info("  SEARCHING: SSH login history, failed login attempts, auth.log entries")
+        self.logger.info("  WHY: Tracks SSH-based lateral movement and brute-force attempts.")
         
         # --- SSH login history ---
         out, _, rc = run_cmd("last -i -n 50 2>/dev/null || last -n 50 2>/dev/null")
@@ -998,6 +1078,8 @@ class LateralMovementDetector:
     
     def check_macos_lateral(self) -> List[Finding]:
         self.logger.info("[LATERAL] Checking macOS lateral movement artifacts...")
+        self.logger.info("  SEARCHING: Login history, Apple Screen Sharing / ARD activity")
+        self.logger.info("  WHY: Screen sharing logs reveal unauthorized remote access to macOS endpoints.")
         
         # SSH logins
         out, _, rc = run_cmd("last -20 2>/dev/null")
@@ -1047,7 +1129,11 @@ class ExfiltrationDetector:
     
     def check_exfil_tools(self) -> List[Finding]:
         """Check for exfiltration tools in running processes."""
-        self.logger.info("[EXFIL] Checking for data exfiltration indicators...")
+        self.logger.info("[EXFIL] Checking running processes for exfiltration tools...")
+        self.logger.info("  SEARCHING: rclone, MegaSync, WinSCP, FileZilla, curl, wget, scp, rsync,")
+        self.logger.info("             7z, rar (archiving tools used for data staging)")
+        self.logger.info("  WHY: Nova uses double extortion - they exfiltrate data BEFORE encrypting.")
+        self.logger.info("       rclone to MEGA is their most common exfil method.")
 
         exfil_tools = ["rclone", "megasync", "winscp", "filezilla", "cyberduck",
                         "7z", "7za", "rar", "tar", "zip",  # archiving for staging
@@ -1074,7 +1160,9 @@ class ExfiltrationDetector:
     
     def check_staging_dirs(self) -> List[Finding]:
         """Look for data staging directories (large archives, temp dirs with bulk data)."""
-        self.logger.info("[EXFIL] Checking for data staging directories...")
+        self.logger.info("[EXFIL] Checking for large archives in staging directories (>50MB)...")
+        self.logger.info("  SEARCHING: .7z, .zip, .rar, .tar archives in TEMP, ProgramData, PerfLogs, /tmp, /dev/shm")
+        self.logger.info("  WHY: Attackers stage stolen data as compressed archives before exfiltration.")
         os_type = get_os_type()
         
         staging_patterns = ["*.7z", "*.zip", "*.rar", "*.tar", "*.tar.gz",
@@ -1117,7 +1205,10 @@ class ExfiltrationDetector:
     
     def check_rclone_config(self) -> List[Finding]:
         """Look for rclone configuration files (key exfil tool for ransomware groups)."""
-        self.logger.info("[EXFIL] Checking for rclone configuration...")
+        self.logger.info("[EXFIL] Searching for rclone configuration files...")
+        self.logger.info("  SEARCHING: rclone.conf in AppData, .config/rclone, all user profiles")
+        self.logger.info("  WHY: rclone configs contain the attacker's cloud storage destination (usually MEGA).")
+        self.logger.info("       This is the #1 exfiltration method for Nova and most RaaS groups.")
         os_type = get_os_type()
         
         rclone_paths = []
@@ -1163,7 +1254,10 @@ class ExfiltrationDetector:
     
     def check_outbound_connections(self) -> List[Finding]:
         """Analyze current outbound connections for suspicious destinations."""
-        self.logger.info("[EXFIL] Checking outbound network connections...")
+        self.logger.info("[EXFIL] Checking outbound connections for suspicious ports and C2 IPs...")
+        self.logger.info("  SEARCHING: Established connections on ports 4444, 5555, 6666, 8888, 9999, 1234,")
+        self.logger.info("             31337, 4443, 8443, 9050/9150 (Tor), and known Nova C2 IPs")
+        self.logger.info("  WHY: Active C2 connections mean the attacker may still have real-time access.")
 
         out = get_system_cache().get_netstat_output()
         
@@ -1174,12 +1268,29 @@ class ExfiltrationDetector:
                              "9050", "9150",  # Tor
                              }
             suspicious_conns = []
+            c2_conns = []
+            c2_ips = set(NOVA_IOCS.get("c2_ips", []))
             for line in out.split("\n"):
+                # Check for known Nova C2 IPs
+                for c2_ip in c2_ips:
+                    if c2_ip in line:
+                        c2_conns.append(line.strip())
+                        break
+                # Check for suspicious ports
                 for port in unusual_ports:
                     if f":{port}" in line and "ESTABLISHED" in line.upper():
                         suspicious_conns.append(line.strip())
                         break
-            
+
+            if c2_conns:
+                self.findings.append(Finding(
+                    self.MODULE,
+                    "ACTIVE CONNECTION TO KNOWN NOVA C2 IP",
+                    f"Found {len(c2_conns)} connections to known Nova command-and-control infrastructure!",
+                    severity=5, mitre_id="T1071",
+                    evidence={"c2_connections": c2_conns, "known_c2_ips": list(c2_ips)},
+                ))
+
             if suspicious_conns:
                 self.findings.append(Finding(
                     self.MODULE,
@@ -1188,7 +1299,7 @@ class ExfiltrationDetector:
                     severity=4, mitre_id="T1048",
                     evidence={"connections": suspicious_conns[:20]},
                 ))
-        
+
         return self.findings
     
     def run_all(self) -> List[Finding]:
@@ -1214,6 +1325,10 @@ class DefenseEvasionDetector:
     
     def check_windows_defense_evasion(self) -> List[Finding]:
         self.logger.info("[EVASION] Checking Windows defense evasion indicators...")
+        self.logger.info("  SEARCHING: Defender status, tamper protection, shadow copies, event log clearing,")
+        self.logger.info("             empty event logs, safe boot config, Defender exclusions")
+        self.logger.info("  WHY: Nova ALWAYS disables Defender and deletes shadow copies before encrypting.")
+        self.logger.info("       Log clearing is done to hamper forensic investigation.")
         
         # --- Windows Defender status ---
         out, _, rc = run_cmd(
@@ -1332,6 +1447,10 @@ class DefenseEvasionDetector:
     
     def check_linux_defense_evasion(self) -> List[Finding]:
         self.logger.info("[EVASION] Checking Linux defense evasion indicators...")
+        self.logger.info("  SEARCHING: Security service status (auditd, rsyslog, fail2ban, EDR agents),")
+        self.logger.info("             log file integrity, iptables rules, bash history anomalies")
+        self.logger.info("  WHY: Attackers stop security services, clear logs, and flush firewall rules")
+        self.logger.info("       to operate undetected and destroy forensic evidence.")
         
         # --- Check if common security services are running ---
         security_services = ["auditd", "rsyslog", "syslog-ng", "fail2ban",
@@ -1439,6 +1558,8 @@ class DefenseEvasionDetector:
     
     def check_macos_defense_evasion(self) -> List[Finding]:
         self.logger.info("[EVASION] Checking macOS defense evasion indicators...")
+        self.logger.info("  SEARCHING: Gatekeeper status, System Integrity Protection (SIP)")
+        self.logger.info("  WHY: Disabled Gatekeeper/SIP allows unsigned malware to run freely.")
         
         # --- Check Gatekeeper status ---
         out, _, rc = run_cmd("spctl --status 2>/dev/null")
@@ -1489,6 +1610,10 @@ class CredentialArtifactHunter:
     def check_credential_dumps(self) -> List[Finding]:
         """Detect LSASS dumps, SAM/SYSTEM hive copies, and other credential artifacts."""
         self.logger.info("[CRED] Checking for credential dumping artifacts...")
+        self.logger.info("  SEARCHING: LSASS memory dumps, SAM/SYSTEM/SECURITY hive copies, NTDS.dit,")
+        self.logger.info("             procdump binaries, /etc/shadow copies in temp dirs")
+        self.logger.info("  WHY: Nova affiliates dump credentials to move laterally and escalate privileges.")
+        self.logger.info("       LSASS dumps contain plaintext passwords; NTDS.dit has all domain hashes.")
         os_type = get_os_type()
 
         if os_type == "windows":
@@ -1579,7 +1704,11 @@ class CredentialArtifactHunter:
 
     def check_powershell_history(self) -> List[Finding]:
         """Check PowerShell ConsoleHost_history.txt for attacker commands."""
-        self.logger.info("[CRED] Checking PowerShell command history...")
+        self.logger.info("[CRED] Checking PowerShell ConsoleHost_history.txt for all users...")
+        self.logger.info("  SEARCHING: invoke-mimikatz, invoke-expression, downloadstring, vssadmin delete,")
+        self.logger.info("             comsvcs.dll, sekurlsa, reg save sam/system, rclone, net user /add")
+        self.logger.info("  WHY: PowerShell history persists by default and captures attacker commands.")
+        self.logger.info("       This is often the best forensic evidence of what the attacker did.")
         os_type = get_os_type()
 
         if os_type != "windows":
@@ -1641,7 +1770,10 @@ class CredentialArtifactHunter:
 
     def check_proc_analysis(self) -> List[Finding]:
         """Linux: check /proc for hidden/deleted binaries and process injection."""
-        self.logger.info("[CRED] Checking /proc for hidden/deleted malware...")
+        self.logger.info("[CRED] Checking /proc for processes with deleted binaries or running from temp dirs...")
+        self.logger.info("  SEARCHING: /proc/*/exe symlinks pointing to (deleted) or /tmp, /dev/shm, /var/tmp")
+        self.logger.info("  WHY: Ransomware often deletes its own binary after execution to avoid detection,")
+        self.logger.info("       but the process stays in memory. This catches fileless/in-memory malware.")
         os_type = get_os_type()
 
         if os_type != "linux":
@@ -1703,7 +1835,11 @@ class CredentialArtifactHunter:
 
     def check_user_accounts(self) -> List[Finding]:
         """Cross-platform check for recently created or suspicious user accounts."""
-        self.logger.info("[CRED] Checking for suspicious user accounts...")
+        self.logger.info("[CRED] Checking for suspicious or recently created user accounts...")
+        self.logger.info("  SEARCHING: Root-equivalent accounts (UID 0), recently created users (<30 days),")
+        self.logger.info("             accounts with login shells in unusual states")
+        self.logger.info("  WHY: Attackers create backdoor accounts (e.g., 'support', 'admin2') for re-entry.")
+        self.logger.info("       UID 0 accounts other than root indicate a rootkit or backdoor.")
         os_type = get_os_type()
         suspicious_users = []
 
@@ -1782,7 +1918,10 @@ class CredentialArtifactHunter:
 
     def check_network_recon(self) -> List[Finding]:
         """Capture ARP table and routing table for lateral movement path analysis."""
-        self.logger.info("[CRED] Capturing network reconnaissance data...")
+        self.logger.info("[CRED] Capturing network reconnaissance data (ARP, routes, interfaces)...")
+        self.logger.info("  SEARCHING: ARP table, routing table, network interface configuration")
+        self.logger.info("  WHY: Shows what other hosts this machine communicated with, revealing")
+        self.logger.info("       the attacker's lateral movement path across your network.")
         os_type = get_os_type()
         recon_data = {}
 
@@ -1842,6 +1981,10 @@ class LiveTriage:
     
     def triage(self) -> List[Finding]:
         self.logger.info("[TRIAGE] Running live system triage...")
+        self.logger.info("  SEARCHING: Current logged-in users, running processes, network connections,")
+        self.logger.info("             listening ports, DNS cache entries")
+        self.logger.info("  WHY: Captures volatile evidence that is lost on reboot. Shows if the attacker")
+        self.logger.info("       is CURRENTLY active on this system right now.")
         os_type = get_os_type()
         triage_data = {"os": os_type, "hostname": socket.gethostname(),
                        "timestamp": datetime.now(timezone.utc).isoformat()}
@@ -2128,11 +2271,14 @@ class ReportGenerator:
             f.write("NOVA/RALORD THREAT INTELLIGENCE\n")
             f.write("=" * 80 + "\n\n")
             f.write("  Group:        Nova RaaS (formerly RALord, rebranded April 2025)\n")
-            f.write("  Payload:      Rust-based ransomware\n")
-            f.write("  Extension:    .ralord\n")
+            f.write("  Payload:      Rust-based ransomware (RC4 PRGA encryption)\n")
+            f.write("  Extensions:   .ralord, .nova, .LORD, .RNOVA\n")
             f.write("  Model:        RaaS (85/15 affiliate split)\n")
             f.write("  Double Extort: Yes (encrypt + data leak threat)\n")
-            f.write("  Known Tox ID: 8E9A6195A769FE7115F087C61D75CF32874C339B3AB...\n")
+            f.write("  Communication: qTox, Session Messenger, Jabber, Nova Chat\n")
+            f.write(f"  Known Tox IDs: {len(NOVA_IOCS['tox_ids'])} tracked\n")
+            f.write(f"  Onion Domains: {len(NOVA_IOCS['onion_domains'])} tracked (leak sites + negotiation)\n")
+            f.write(f"  C2 IPs:       {', '.join(NOVA_IOCS.get('c2_ips', []))}\n")
             f.write("  Initial Access: Exposed RDP/VPN, phishing, compromised creds\n")
             f.write("  Key TTPs:     Backup deletion, AV disabling, rclone exfil,\n")
             f.write("                LOLBins, lateral via PsExec/RDP/SMB\n")

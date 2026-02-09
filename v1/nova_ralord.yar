@@ -20,16 +20,24 @@ rule Nova_RALord_Ransom_Note
     
     strings:
         $tox1 = "8E9A6195A769FE7115F087C61D75CF32874C339B3AB0947D07480C9A8A12DA5009151BE6A51F" ascii wide nocase
+        $tox2 = "0C8E5B45C57AE244E9C904C5BC74F73306937469D9CEA22541CA69AC162B8D42A20F4C0382AC" ascii wide nocase
         $token1 = "054f55ec93aca9bac362b9d91eff36a7ce451e7caba47c0b2e004ba429f9529c79" ascii wide nocase
         $onion1 = "novavdivko2zvtrvtllnq45lxhba2rfzp76qigb4nrliklem5au7czqd" ascii wide nocase
         $onion2 = "pifk3xu3vad6cuxsjll4qjomyaaaoyvnyqppro75pazadzctrrvpdnyd" ascii wide nocase
         $onion3 = "novadmrkp4vbk2padk5t6pb" ascii wide nocase
+        $onion4 = "ralordt7gywtkkkkq2suldao6mpibsb7cpjvdfezpzwgltyj2laiuuid" ascii wide nocase
+        $onion5 = "ralord3htj7v2dkavss2hjzviviwgsf4anfdnihn5qcjl6eb5if3cuqd" ascii wide nocase
+        $onion6 = "ralordqe33mpufkpsr6zkdatktlu3t2uei4ught3sitxgtzfmqmbsuyd" ascii wide nocase
+        $onion7 = "novav75eqkjoxct7xuhhwnjw5uaaxvznhtbykq6zal5x7tfevxzjyqyd" ascii wide nocase
+        $onion8 = "novavagygnhqyf7a5tgbuvmujve5a2jzgbrq2n4dvetkhvr2zjg27cad" ascii wide nocase
         $brand1 = "Nova" ascii wide
         $brand2 = "RALord" ascii wide nocase
         $msg1   = "your files have been encrypted" ascii wide nocase
         $msg2   = "data has been stolen" ascii wide nocase
         $msg3   = "qtox" ascii wide nocase
-    
+        $msg4   = "session messenger" ascii wide nocase
+        $msg5   = "jabber" ascii wide nocase
+
     condition:
         any of ($tox*, $token*, $onion*) or
         (any of ($brand*) and any of ($msg*))
@@ -42,12 +50,15 @@ rule Nova_RALord_Encrypted_File
         author      = "IR Team"
         severity    = "critical"
         mitre       = "T1486"
-    
+
     strings:
         $marker1 = ".ralord" ascii wide
         $marker2 = "RALORD" ascii wide
         $marker3 = "NOVA_ENCRYPTED" ascii wide
-    
+        $marker4 = ".nova" ascii wide
+        $marker5 = ".LORD" ascii wide
+        $marker6 = ".RNOVA" ascii wide
+
     condition:
         any of them in (filesize - 64 .. filesize) or
         any of them at 0
@@ -61,18 +72,25 @@ rule Nova_RALord_Payload_Windows
         severity    = "critical"
         mitre       = "T1486"
         hash_sha256 = "456b9adaabae9f3dce2207aa71410987f0a571cd8c11f2e7b41468501a863606"
-        hash_md5    = "be15f62d14d1cbe2aecce8396f4c6289"
-    
+        hash_md5_1  = "be15f62d14d1cbe2aecce8396f4c6289"
+        hash_md5_2  = "ef846baabc14fe461cff4c4a0fd5056f"
+        hash_md5_3  = "4566f5ba6d1a1db0dd7794ea8d791b3f"
+        hash_md5_4  = "4924b945cfdc5bfece03f5140a546384"
+
     strings:
         $rust1 = "rust_begin_unwind" ascii
         $rust2 = ".rlib" ascii
         $rust3 = "core::panicking" ascii
-        
+
         $enc1  = "encrypt" ascii nocase
         $enc2  = ".ralord" ascii
         $enc3  = "AES" ascii
         $enc4  = "ChaCha" ascii
         $enc5  = "RSA" ascii
+        $enc6  = "RC4" ascii
+        $enc7  = ".nova" ascii
+        $enc8  = ".LORD" ascii
+        $enc9  = ".RNOVA" ascii
         
         $del1  = "vssadmin delete shadows" ascii wide nocase
         $del2  = "wmic shadowcopy delete" ascii wide nocase
@@ -105,7 +123,11 @@ rule Nova_RALord_Payload_Linux
         
         $enc1  = ".ralord" ascii
         $enc2  = "encrypt" ascii nocase
-        
+        $enc3  = ".nova" ascii
+        $enc4  = ".LORD" ascii
+        $enc5  = ".RNOVA" ascii
+        $enc6  = "RC4" ascii
+
         $esxi1 = "esxcli" ascii
         $esxi2 = "vim-cmd" ascii
         $esxi3 = ".vmdk" ascii

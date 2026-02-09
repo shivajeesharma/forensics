@@ -47,13 +47,24 @@ Write-Log "Output: $OutputDir"
 # ── Known IOCs ─────────────────────────────────────────────────────────────────
 $NovaIOCs = @{
     SHA256       = @("456b9adaabae9f3dce2207aa71410987f0a571cd8c11f2e7b41468501a863606")
-    MD5          = @("be15f62d14d1cbe2aecce8396f4c6289")
-    ToxID        = "8E9A6195A769FE7115F087C61D75CF32874C339B3AB0947D07480C9A8A12DA5009151BE6A51F"
-    FileExt      = ".ralord"
+    MD5          = @("be15f62d14d1cbe2aecce8396f4c6289",
+                     "ef846baabc14fe461cff4c4a0fd5056f",
+                     "4566f5ba6d1a1db0dd7794ea8d791b3f",
+                     "4924b945cfdc5bfece03f5140a546384")
+    ToxIDs       = @("8E9A6195A769FE7115F087C61D75CF32874C339B3AB0947D07480C9A8A12DA5009151BE6A51F",
+                     "0C8E5B45C57AE244E9C904C5BC74F73306937469D9CEA22541CA69AC162B8D42A20F4C0382AC")
+    FileExts     = @(".ralord",".nova",".LORD",".RNOVA")
     OnionDomains = @(
         "novavdivko2zvtrvtllnq45lxhba2rfzp76qigb4nrliklem5au7czqd.onion",
-        "pifk3xu3vad6cuxsjll4qjomyaaaoyvnyqppro75pazadzctrrvpdnyd.onion"
+        "pifk3xu3vad6cuxsjll4qjomyaaaoyvnyqppro75pazadzctrrvpdnyd.onion",
+        "novadmrkp4vbk2padk5t6pbxolndceuc7hrcq4mjaoyed6nxsqiuzyyd.onion",
+        "novav75eqkjoxct7xuhhwnjw5uaaxvznhtbykq6zal5x7tfevxzjyqyd.onion",
+        "novavagygnhqyf7a5tgbuvmujve5a2jzgbrq2n4dvetkhvr2zjg27cad.onion",
+        "ralordt7gywtkkkkq2suldao6mpibsb7cpjvdfezpzwgltyj2laiuuid.onion",
+        "ralord3htj7v2dkavss2hjzviviwgsf4anfdnihn5qcjl6eb5if3cuqd.onion",
+        "ralordqe33mpufkpsr6zkdatktlu3t2uei4ught3sitxgtzfmqmbsuyd.onion"
     )
+    C2IPs        = @("144.172.92.192","144.172.95.78")
     SuspTools    = @("rclone","psexec","psexec64","megasync","winscp","mimikatz",
                      "lazagne","sharphound","bloodhound","anydesk","chisel","ngrok",
                      "advanced_ip_scanner","netscan")
@@ -62,7 +73,8 @@ $NovaIOCs = @{
 # ══════════════════════════════════════════════════════════════════════════════
 # 1. SYSTEM INFO
 # ══════════════════════════════════════════════════════════════════════════════
-Write-Log "Collecting system information..."
+Write-Log "Collecting system information (hostname, domain, OS, IPs, last boot)..."
+Write-Log "  WHY: Establishes the identity and state of this endpoint for the IR report."
 $sysInfo = @{
     Hostname     = $env:COMPUTERNAME
     Domain       = $env:USERDOMAIN
@@ -75,29 +87,33 @@ $sysInfo = @{
 $sysInfo | ConvertTo-Json | Out-File (Join-Path $OutputDir "01_system_info.json")
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 2. ENCRYPTED FILES (.ralord)
+# 2. ENCRYPTED FILES
 # ══════════════════════════════════════════════════════════════════════════════
-Write-Log "Scanning for .ralord encrypted files..."
+Write-Log "Scanning for files encrypted by Nova/RALord (extensions: $($NovaIOCs.FileExts -join ', '))..."
+Write-Log "  WHY: Nova appends these extensions after encrypting files. Finding them confirms active encryption."
 $encryptedFiles = @()
 foreach ($drive in (Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Used -gt 0 })) {
-    try {
-        $found = Get-ChildItem -Path "$($drive.Root)" -Filter "*.ralord" -Recurse -Depth 15 -ErrorAction SilentlyContinue |
-                 Select-Object FullName, Length, CreationTimeUtc, LastWriteTimeUtc -First 500
-        $encryptedFiles += $found
-    } catch {}
+    foreach ($ext in $NovaIOCs.FileExts) {
+        try {
+            $found = Get-ChildItem -Path "$($drive.Root)" -Filter "*$ext" -Recurse -Depth 15 -ErrorAction SilentlyContinue |
+                     Select-Object FullName, Length, CreationTimeUtc, LastWriteTimeUtc, @{N='Extension';E={$ext}} -First 500
+            $encryptedFiles += $found
+        } catch {}
+    }
 }
 
 if ($encryptedFiles.Count -gt 0) {
-    Write-Log "CRITICAL: Found $($encryptedFiles.Count) .ralord encrypted files!" "CRITICAL"
+    Write-Log "CRITICAL: Found $($encryptedFiles.Count) encrypted files!" "CRITICAL"
     $encryptedFiles | Export-Csv (Join-Path $OutputDir "02_encrypted_files.csv") -NoTypeInformation
 } else {
-    Write-Log "No .ralord files found" "SUCCESS"
+    Write-Log "No encrypted files found with known Nova extensions" "SUCCESS"
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 3. RANSOM NOTES
 # ══════════════════════════════════════════════════════════════════════════════
-Write-Log "Scanning for ransom notes..."
+Write-Log "Scanning for ransom notes (README.txt, RECOVERY.txt, HOW_TO_RECOVER.txt, etc.)..."
+Write-Log "  WHY: Nova drops ransom notes in every encrypted directory. Content reveals Tox ID, onion URLs."
 $noteNames = @("README.txt","RECOVERY.txt","HOW_TO_RECOVER.txt","RESTORE_FILES.txt","!README!.txt")
 $ransomNotes = @()
 
@@ -108,7 +124,7 @@ foreach ($drive in (Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Used 
                      Select-Object FullName, Length, LastWriteTimeUtc -First 50
             foreach ($f in $found) {
                 $content = Get-Content $f.FullName -Raw -ErrorAction SilentlyContinue
-                $novaMatch = $content -match "(?i)(nova|ralord|qtox|tox id|onion|novavdivko)"
+                $novaMatch = $content -match "(?i)(nova|ralord|qtox|tox id|onion|novavdivko|ralordt7|session messenger|jabber)"
                 $ransomNotes += [PSCustomObject]@{
                     Path         = $f.FullName
                     Size         = $f.Length
@@ -135,7 +151,9 @@ if ($ransomNotes.Count -gt 0) {
 # ══════════════════════════════════════════════════════════════════════════════
 # 4. RUNNING PROCESSES
 # ══════════════════════════════════════════════════════════════════════════════
-Write-Log "Capturing running processes..."
+Write-Log "Capturing running processes and checking for attacker tools..."
+Write-Log "  SEARCHING: rclone, PsExec, mimikatz, LaZagne, SharpHound, AnyDesk, chisel, ngrok, etc."
+Write-Log "  WHY: Identifies currently running attacker tools and captures volatile process evidence."
 # Single WMI query upfront instead of per-process queries (orders of magnitude faster)
 $wmiProcs = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
     Select-Object ProcessId, Name, ExecutablePath, CommandLine, ParentProcessId, CreationDate
@@ -166,12 +184,21 @@ if ($suspProcs) {
 # ══════════════════════════════════════════════════════════════════════════════
 # 5. NETWORK CONNECTIONS
 # ══════════════════════════════════════════════════════════════════════════════
-Write-Log "Capturing network connections..."
+Write-Log "Capturing network connections (checking for C2 ports and known Nova IPs)..."
+Write-Log "  SEARCHING: Connections on ports 4444,5555,6666,8888,9999,1234,31337,9050,9150,4443,8443"
+Write-Log "  WHY: Active outbound connections reveal if the attacker is still connected to this host."
 $netConns = Get-NetTCPConnection | Select-Object LocalAddress, LocalPort, RemoteAddress, RemotePort,
     State, OwningProcess,
     @{N='ProcessName';E={(Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue).ProcessName}}
 
 $netConns | Export-Csv (Join-Path $OutputDir "05_network_connections.csv") -NoTypeInformation
+
+# Flag connections to known Nova C2 IPs
+$c2Conns = $netConns | Where-Object { $_.RemoteAddress -in $NovaIOCs.C2IPs }
+if ($c2Conns) {
+    Write-Log "ACTIVE CONNECTION TO KNOWN NOVA C2 IP: $($c2Conns.RemoteAddress -join ', ')" "CRITICAL"
+    $c2Conns | Export-Csv (Join-Path $OutputDir "05_c2_connections.csv") -NoTypeInformation
+}
 
 # Flag suspicious ports
 $suspPorts = @(4444,5555,6666,8888,9999,1234,31337,9050,9150,4443,8443)
@@ -184,7 +211,8 @@ if ($suspConns) {
 # ══════════════════════════════════════════════════════════════════════════════
 # 6. PERSISTENCE MECHANISMS
 # ══════════════════════════════════════════════════════════════════════════════
-Write-Log "Checking persistence mechanisms..."
+Write-Log "Checking persistence mechanisms (registry run keys, scheduled tasks, services)..."
+Write-Log "  WHY: Nova affiliates establish persistence to survive reboots and maintain access."
 
 # Registry Run keys
 $regPaths = @(
@@ -219,7 +247,7 @@ if ($suspReg) {
 }
 
 # Scheduled Tasks
-Write-Log "Checking scheduled tasks..."
+Write-Log "Checking scheduled tasks for suspicious entries (temp, PowerShell encoded, cmd /c)..."
 $tasks = Get-ScheduledTask | Where-Object { $_.State -ne 'Disabled' } |
     Select-Object TaskName, TaskPath, State,
     @{N='Action';E={$_.Actions.Execute}},
@@ -238,7 +266,7 @@ if ($suspTasks) {
 }
 
 # Services
-Write-Log "Checking services..."
+Write-Log "Checking auto-start services for binaries in unusual locations..."
 $services = Get-CimInstance Win32_Service | Where-Object { $_.StartMode -eq 'Auto' } |
     Select-Object Name, DisplayName, State, PathName, StartMode, StartName
 
@@ -254,7 +282,8 @@ if ($suspSvc) {
 # ══════════════════════════════════════════════════════════════════════════════
 # 7. DEFENDER & SECURITY STATUS
 # ══════════════════════════════════════════════════════════════════════════════
-Write-Log "Checking Windows Defender status..."
+Write-Log "Checking Windows Defender status (real-time, behavior, tamper protection, exclusions)..."
+Write-Log "  WHY: Nova ALWAYS disables Defender before encryption. Exclusions may reveal attacker paths."
 
 try {
     $defender = Get-MpPreference
@@ -280,7 +309,8 @@ try {
 # ══════════════════════════════════════════════════════════════════════════════
 # 8. SHADOW COPIES & BACKUPS
 # ══════════════════════════════════════════════════════════════════════════════
-Write-Log "Checking Volume Shadow Copies..."
+Write-Log "Checking Volume Shadow Copies (VSS)..."
+Write-Log "  WHY: Nova deletes all shadow copies to prevent file recovery. Missing VSS = encryption likely."
 $vss = vssadmin list shadows 2>&1
 $vss | Out-File (Join-Path $OutputDir "08_shadow_copies.txt")
 
@@ -294,7 +324,9 @@ if ($vss -match "No items found" -or $vss -match "no shadow copies") {
 # ══════════════════════════════════════════════════════════════════════════════
 # 9. EVENT LOG ANALYSIS
 # ══════════════════════════════════════════════════════════════════════════════
-Write-Log "Analyzing Security Event Logs..."
+Write-Log "Analyzing Security Event Logs (1102=log cleared, 4624=logons, 4625=failed, 4104=PowerShell)..."
+Write-Log "  WHY: Event logs reveal the attacker's actions - RDP sessions, credential brute-forcing,"
+Write-Log "       PowerShell commands used, and whether they tried to cover their tracks by clearing logs."
 
 # Log clearing events (1102)
 $logClears = Get-WinEvent -FilterHashtable @{LogName='Security'; ID=1102} -MaxEvents 20 -ErrorAction SilentlyContinue
@@ -356,7 +388,8 @@ if ($psLogs) {
 # ══════════════════════════════════════════════════════════════════════════════
 # 10. EXFILTRATION CHECKS
 # ══════════════════════════════════════════════════════════════════════════════
-Write-Log "Checking for exfiltration indicators..."
+Write-Log "Checking for exfiltration indicators (rclone configs, staged archives, suspicious DNS)..."
+Write-Log "  WHY: Nova uses double extortion - data is stolen BEFORE encryption via rclone to MEGA."
 
 # Rclone config
 $rclonePaths = @(
@@ -396,7 +429,9 @@ if ($dnsCache) {
 # ══════════════════════════════════════════════════════════════════════════════
 # 11. RECENTLY MODIFIED FILES (Last 48h in key dirs)
 # ══════════════════════════════════════════════════════════════════════════════
-Write-Log "Checking recently modified files (48h)..."
+Write-Log "Checking recently modified executables/scripts in system dirs (last 48h)..."
+Write-Log "  SEARCHING: .exe, .dll, .bat, .ps1, .vbs, .js, .hta, .cmd, .sys in System32, Temp, ProgramData"
+Write-Log "  WHY: Identifies malware dropped in the last 48 hours for timeline analysis."
 $cutoff = (Get-Date).AddHours(-48)
 $recentDirs = @("$env:SYSTEMROOT\System32", "$env:SYSTEMROOT\Temp", "$env:TEMP", "$env:PROGRAMDATA")
 
@@ -417,7 +452,8 @@ if ($recentFiles) {
 # ══════════════════════════════════════════════════════════════════════════════
 # 12. USERS & GROUPS
 # ══════════════════════════════════════════════════════════════════════════════
-Write-Log "Enumerating local users and admin group..."
+Write-Log "Enumerating local users, admin group members, and recently created accounts..."
+Write-Log "  WHY: Attackers create backdoor admin accounts for re-entry (e.g., 'support', 'admin2')."
 $localUsers = Get-LocalUser | Select-Object Name, Enabled, LastLogon, PasswordLastSet, Description
 $localUsers | Export-Csv (Join-Path $OutputDir "12_local_users.csv") -NoTypeInformation
 
