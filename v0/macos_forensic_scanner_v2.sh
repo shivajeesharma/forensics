@@ -254,7 +254,7 @@ phase_persistence() {
     info "Scanning LaunchAgents/Daemons..."
     for dir in "$HOME/Library/LaunchAgents" /Library/LaunchAgents /Library/LaunchDaemons; do
         [ -d "$dir" ] || continue
-        for plist in "$dir"/*.plist 2>/dev/null; do
+        for plist in "$dir"/*.plist; do
             [ -f "$plist" ] || continue
             ts=$(stat -f '%Sm' -t '%Y-%m-%d %H:%M:%S' "$plist" 2>/dev/null || echo "UNKNOWN")
             label=$(defaults read "$plist" Label 2>/dev/null || basename "$plist")
