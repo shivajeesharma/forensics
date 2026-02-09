@@ -174,7 +174,7 @@ phase_execution() {
             echo "$np$cl" | grep -qiE "powershell|pwsh" && { sev="MEDIUM"; tech="T1059.001 PowerShell"; }
             echo "$cl" | grep -qiE "certutil|bitsadmin|mshta|regsvr32|rundll32|wscript|cscript" && { sev="HIGH"; tech="T1218 Signed Binary Proxy"; }
             echo "$cl" | grep -qiE "EncodedCommand|hidden|bypass|downloadstring|IEX|nova|beacon" && { sev="CRITICAL"; tech="T1059 Suspicious Exec"; }
-            echo "$np" | grep -qiE "\\\\temp\\\\|\\\\tmp\\\\|\\\\appdata\\\\" && [ "$sev" = "INFO" ] && { sev="HIGH"; tech="T1204 User Execution"; }
+            echo "$np" | grep -qi -e "temp" -e "tmp" -e "appdata" && [ "$sev" = "INFO" ] && { sev="HIGH"; tech="T1204 User Execution"; }
             [ "$sev" != "INFO" ] && {
                 tl "$_TS" "$sev" "Execution" "$tech" "$fn" "Proc[4688]: $np | Cmd:$(echo "$cl" | cut -c1-200) | Parent:$pp"
                 echo "[$_TS][$sev] $np | $cl" >> "$rpt"; echo x >> "$hc"
@@ -197,7 +197,7 @@ phase_execution() {
             local img=$(echo "$blk" | grep -oP 'Image">\K[^<]+' 2>/dev/null | head -1)
             local cl=$(echo "$blk" | grep -oP 'CommandLine">\K[^<]+' 2>/dev/null | head -1)
             local pi=$(echo "$blk" | grep -oP 'ParentImage">\K[^<]+' 2>/dev/null | head -1)
-            if echo "$img$cl" | grep -qiE "powershell|cmd\.exe|certutil|bitsadmin|mshta|regsvr32|rundll32|nova|beacon|\\\\temp\\\\"; then
+            if echo "$img$cl" | grep -qiE "powershell|cmd.exe|certutil|bitsadmin|mshta|regsvr32|rundll32|nova|beacon" || echo "$img$cl" | grep -qi "temp"; then
                 tl "$_TS" "HIGH" "Execution" "T1059 Scripting" "$fn" "Sysmon[1]: $img | $(echo "$cl" | cut -c1-200) | parent:$pi"
                 echo "[$_TS] Sysmon: $img | $cl" >> "$rpt"; echo x >> "$hc"
             fi
@@ -219,7 +219,7 @@ phase_persistence() {
             ectx "$xf" "$ln"; local blk=$(sed -n "$((ln)),$((ln+30))p" "$xf" 2>/dev/null)
             local sn=$(echo "$blk" | grep -oP 'ServiceName">\K[^<]+' 2>/dev/null | head -1)
             local sp=$(echo "$blk" | grep -oP 'ImagePath">\K[^<]+' 2>/dev/null | head -1)
-            local sev="MEDIUM"; echo "$sp" | grep -qiE "powershell|cmd|temp\\\\|tmp\\\\|nova|beacon|payload" && { sev="CRITICAL"; crit "Suspicious svc: $sn → $sp"; }
+            local sev="MEDIUM"; if echo "$sp" | grep -qiE "powershell|cmd|nova|beacon|payload" || echo "$sp" | grep -qi -e "temp" -e "tmp"; then sev="CRITICAL"; crit "Suspicious svc: $sn -> $sp"; fi
             tl "$_TS" "$sev" "Persistence" "T1543.003 Windows Service" "$fn" "New svc: $sn | $sp [7045]"
             echo "[$_TS][$sev] Svc: $sn → $sp" >> "$rpt"; echo x >> "$hc"
         done
@@ -232,7 +232,7 @@ phase_persistence() {
             echo "[$_TS] Task: $tn" >> "$rpt"; echo x >> "$hc"
         done
         # Registry Run keys
-        grep -n -iE 'HKLM.*\\Run|HKCU.*\\Run|New-ItemProperty.*Run|CurrentVersion.*\\Run' "$xf" 2>/dev/null | head -50 | while IFS=: read -r ln _; do
+        grep -n -iE 'HKLM.*Run|HKCU.*Run|New-ItemProperty.*Run|CurrentVersion.*Run' "$xf" 2>/dev/null | head -50 | while IFS=: read -r ln _; do
             ectx "$xf" "$ln"; local ml=$(sed -n "${ln}p" "$xf" | sed 's/^[[:space:]]*//' | cut -c1-300)
             tl "$_TS" "CRITICAL" "Persistence" "T1547.001 Registry Run Keys" "$fn" "Run key: $ml [$_EID]"
             crit "Run key persistence"; echo "[$_TS] Run key: $ml" >> "$rpt"; echo x >> "$hc"
@@ -254,7 +254,7 @@ phase_persistence() {
             ectx "$xf" "$ln"; [ "$_EID" = "13" ] || continue
             local blk=$(sed -n "$((ln)),$((ln+25))p" "$xf" 2>/dev/null)
             local to=$(echo "$blk" | grep -oP 'TargetObject">\K[^<]+' 2>/dev/null | head -1)
-            echo "$to" | grep -qiE "\\\\Run\\\\|\\\\RunOnce\\\\|\\\\Startup" && {
+            echo "$to" | grep -qi -e "Run" -e "RunOnce" -e "Startup" && {
                 local dt=$(echo "$blk" | grep -oP 'Details">\K[^<]+' 2>/dev/null | head -1)
                 tl "$_TS" "CRITICAL" "Persistence" "T1547.001 Registry Run" "$fn" "Sysmon Reg[13]: $to → $(echo "$dt" | cut -c1-200)"
                 echo "[$_TS] Reg: $to → $dt" >> "$rpt"; echo x >> "$hc"
@@ -292,7 +292,7 @@ phase_privesc() {
         grep -n '>4672<' "$xf" 2>/dev/null | while IFS=: read -r ln _; do
             ectx "$xf" "$ln"; local blk=$(sed -n "$((ln)),$((ln+20))p" "$xf" 2>/dev/null)
             local u=$(echo "$blk" | grep -oP 'SubjectUserName">\K[^<]+' 2>/dev/null | head -1)
-            echo "$u" | grep -qiE "^SYSTEM$|^LOCAL SERVICE$|^NETWORK SERVICE$|\\$$" && continue
+            case "$u" in SYSTEM|"LOCAL SERVICE"|"NETWORK SERVICE") continue;; esac; echo "$u" | grep -q "\$$" && continue
             [ -z "$u" ] && continue
             tl "$_TS" "MEDIUM" "Privilege Escalation" "T1134 Token Manipulation" "$fn" "Special privs: $u [4672]"
             echo "[$_TS] Privs: $u" >> "$rpt"; echo x >> "$hc"
