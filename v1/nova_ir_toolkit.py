@@ -26,14 +26,19 @@
    3. Lateral Movement    - RDP, SMB, WMI, PsExec, SSH traces
    4. Exfiltration Detect - Large outbound transfers, cloud upload tools, staging dirs
    5. Defense Evasion     - Disabled AV/EDR, tampered logs, shadow copy deletion
-   6. Timeline Builder    - Consolidates all findings into a chronological timeline
-   7. Live Triage         - Current connections, processes, users, open files
+   6. Live Triage         - Current connections, processes, users, open files
+   7. Timeline Builder    - Consolidates all findings into a chronological timeline
+   8. EVTX Analyzer       - Offline .evtx event log parsing (Security, System, Sysmon, PS, RDP)
+   *  Nova Confidence Scorer - Weighted attribution scoring for definitive Nova identification
+   *  MITRE ATT&CK Report   - Tactic-by-tactic MITRE mapped report (JSON + TXT)
 
  USAGE:
    Run as Administrator/root:
      python3 nova_ir_toolkit.py [--output-dir /path/to/output] [--modules all]
      python3 nova_ir_toolkit.py --modules ioc,persistence,timeline
      python3 nova_ir_toolkit.py --quick   (fast triage only)
+     python3 nova_ir_toolkit.py --evtx /path/to/logs/  (offline EVTX analysis)
+     python3 nova_ir_toolkit.py --modules evtx --evtx /path/to/Security.evtx
 
  NOTES:
    - Does NOT modify the system (read-only forensics)
@@ -59,6 +64,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from collections import defaultdict
 from typing import List, Dict, Optional, Any, Tuple
+import xml.etree.ElementTree as ET
+
+# Optional: python-evtx for offline .evtx file parsing
+try:
+    import Evtx.Evtx as evtx
+    import Evtx.Views as evtx_views
+    HAS_EVTX = True
+except ImportError:
+    HAS_EVTX = False
 
 # ============================================================================
 # CONFIGURATION & KNOWN IOCs
@@ -187,6 +201,8 @@ MITRE_MAPPING = {
     "T1491": "Defacement - Desktop wallpaper changed to ransom message",
     "T1070": "Indicator Removal - Log clearing and anti-forensics",
     "T1543": "Create or Modify System Process - Persistence via services",
+    "T1110": "Brute Force - Repeated failed logon attempts",
+    "T1098": "Account Manipulation - Modifying account permissions/group membership",
 }
 
 
@@ -222,6 +238,129 @@ def get_os_type() -> str:
     if s == "darwin":
         return "macos"
     return s  # "windows" or "linux"
+
+
+def get_os_info() -> Dict[str, str]:
+    """Return detailed OS identification: type, version, distribution, architecture."""
+    info: Dict[str, str] = {
+        "os_type": get_os_type(),
+        "platform": platform.platform(),
+        "architecture": platform.machine(),
+        "hostname": socket.gethostname(),
+        "version": "",
+        "distribution": "",
+        "kernel": "",
+    }
+    os_type = info["os_type"]
+
+    if os_type == "windows":
+        info["version"] = platform.version()  # e.g. "10.0.19041"
+        win_ver = platform.win32_ver()  # ('10', '10.0.19041', 'SP0', 'Multiprocessor Free')
+        if win_ver and win_ver[0]:
+            info["distribution"] = f"Windows {win_ver[0]}"
+        else:
+            info["distribution"] = f"Windows {platform.release()}"
+        # Try to get edition (Pro, Server, Enterprise)
+        try:
+            out, _, rc = run_cmd('wmic os get Caption /value 2>nul', timeout=10)
+            if rc == 0 and out:
+                for line in out.split("\n"):
+                    if "Caption=" in line:
+                        info["distribution"] = line.split("=", 1)[1].strip()
+                        break
+        except Exception:
+            pass
+
+    elif os_type == "linux":
+        info["kernel"] = platform.release()  # e.g. "5.15.0-76-generic"
+        # Read /etc/os-release for distro info (works on all modern distros)
+        distro_name = ""
+        distro_version = ""
+        try:
+            with open("/etc/os-release", "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("PRETTY_NAME="):
+                        info["distribution"] = line.split("=", 1)[1].strip().strip('"')
+                    elif line.startswith("NAME="):
+                        distro_name = line.split("=", 1)[1].strip().strip('"')
+                    elif line.startswith("VERSION_ID="):
+                        distro_version = line.split("=", 1)[1].strip().strip('"')
+                    elif line.startswith("VERSION="):
+                        info["version"] = line.split("=", 1)[1].strip().strip('"')
+        except (FileNotFoundError, PermissionError):
+            pass
+
+        if not info["distribution"]:
+            # Fallback: try lsb_release, /etc/redhat-release, etc.
+            for release_file in ["/etc/redhat-release", "/etc/centos-release",
+                                 "/etc/fedora-release", "/etc/debian_version",
+                                 "/etc/SuSE-release", "/etc/alpine-release"]:
+                try:
+                    with open(release_file, "r") as f:
+                        info["distribution"] = f.read().strip()
+                        break
+                except (FileNotFoundError, PermissionError):
+                    continue
+
+        if not info["distribution"] and distro_name:
+            info["distribution"] = f"{distro_name} {distro_version}".strip()
+
+        if not info["distribution"]:
+            info["distribution"] = f"Linux ({info['kernel']})"
+
+    elif os_type == "macos":
+        info["kernel"] = platform.release()
+        mac_ver = platform.mac_ver()  # ('14.5', ('', '', ''), 'arm64')
+        if mac_ver and mac_ver[0]:
+            info["version"] = mac_ver[0]
+            # Map macOS version to name
+            major = int(mac_ver[0].split(".")[0]) if mac_ver[0] else 0
+            mac_names = {
+                11: "Big Sur", 12: "Monterey", 13: "Ventura",
+                14: "Sonoma", 15: "Sequoia",
+            }
+            name = mac_names.get(major, "")
+            info["distribution"] = f"macOS {mac_ver[0]} {name}".strip()
+        else:
+            info["distribution"] = f"macOS ({platform.platform()})"
+
+    return info
+
+
+# Module applicability per OS
+OS_MODULE_MAP = {
+    "windows": {
+        "ioc": "Full (file scan, hash check, tools, ransom notes)",
+        "persistence": "Full (registry, services, scheduled tasks, WMI, BITS)",
+        "lateral": "Full (RDP, SMB, WMI, PsExec, logon events)",
+        "exfil": "Full (rclone config, staging dirs, outbound connections)",
+        "evasion": "Full (Defender, shadow copies, event logs, tamper protection)",
+        "creds": "Full (LSASS dumps, hive copies, PowerShell history, user accounts)",
+        "triage": "Full (processes, connections, DNS cache, listeners)",
+        "evtx": "Full (offline .evtx event log parsing)",
+    },
+    "linux": {
+        "ioc": "Full (file scan, hash check, tools, ransom notes)",
+        "persistence": "Full (cron, systemd, authorized_keys, rc.local, profiles)",
+        "lateral": "Full (SSH history, auth.log, failed logins)",
+        "exfil": "Full (rclone config, staging dirs, outbound connections)",
+        "evasion": "Full (security services, log integrity, iptables, bash history)",
+        "creds": "Full (/proc analysis, shadow copies, user accounts, network recon)",
+        "triage": "Full (processes, connections, listeners)",
+        "evtx": "Offline only (parses Windows .evtx files collected from other hosts)",
+    },
+    "macos": {
+        "ioc": "Full (file scan, hash check, tools, ransom notes)",
+        "persistence": "Full (LaunchAgents, LaunchDaemons, login items)",
+        "lateral": "Partial (login history, Screen Sharing/ARD)",
+        "exfil": "Full (rclone config, staging dirs, outbound connections)",
+        "evasion": "Partial (Gatekeeper, SIP status)",
+        "creds": "Partial (user accounts, network recon)",
+        "triage": "Full (processes, connections, listeners)",
+        "evtx": "Offline only (parses Windows .evtx files collected from other hosts)",
+    },
+}
 
 def run_cmd(cmd: str, shell: bool = True, timeout: int = 60) -> Tuple[str, str, int]:
     """Execute a command and return stdout, stderr, returncode."""
@@ -440,16 +579,46 @@ class IOCScanner:
                         matched_pattern = bool(note_pattern_re and note_pattern_re.match(fname))
                         if matched_name or matched_pattern:
                             fpath = os.path.join(dirpath, fname)
-                            note_info = {"path": fpath, "matched_by": "pattern" if matched_pattern else "filename"}
-                            # Check content for Nova-specific keywords
+                            stat_info = safe_stat(fpath)
+                            note_info = {
+                                "path": fpath,
+                                "filename": fname,
+                                "directory": dirpath,
+                                "matched_by": "pattern" if matched_pattern else "filename",
+                            }
+                            if stat_info:
+                                note_info["size_bytes"] = stat_info.get("size_bytes", 0)
+                                note_info["created"] = stat_info.get("created", "")
+                                note_info["modified"] = stat_info.get("modified", "")
+                            # Check content for Nova-specific keywords and extract contact info
                             try:
                                 with open(fpath, "r", errors="ignore") as nf:
-                                    content = nf.read(4096).lower()
+                                    raw_content = nf.read(4096)
+                                    content = raw_content.lower()
                                     matched_kw = [kw for kw in NOVA_IOCS["ransom_note_keywords"] if kw in content]
                                     if matched_kw:
                                         note_info["matched_keywords"] = matched_kw
                                         note_info["confirmed_nova"] = True
                                         note_info["matched_by"] += "+content"
+                                    # Extract Tox IDs (64-76 hex chars)
+                                    tox_matches = re.findall(r'[A-Fa-f0-9]{64,76}', raw_content)
+                                    if tox_matches:
+                                        note_info["extracted_tox_ids"] = tox_matches[:5]
+                                    # Extract onion domains
+                                    onion_matches = re.findall(r'[a-z2-7]{16,56}\.onion', raw_content, re.I)
+                                    if onion_matches:
+                                        note_info["extracted_onion_domains"] = onion_matches[:5]
+                                    # Extract email addresses
+                                    email_matches = re.findall(r'[\w.+-]+@[\w-]+\.[\w.]+', raw_content)
+                                    if email_matches:
+                                        note_info["extracted_emails"] = email_matches[:5]
+                                    # Extract BTC/XMR wallet addresses
+                                    btc_matches = re.findall(r'\b[13][a-km-zA-HJ-NP-Z1-9]{25,34}\b', raw_content)
+                                    xmr_matches = re.findall(r'\b4[0-9AB][1-9A-HJ-NP-Za-km-z]{93}\b', raw_content)
+                                    if btc_matches:
+                                        note_info["extracted_btc_wallets"] = btc_matches[:3]
+                                    if xmr_matches:
+                                        note_info["extracted_xmr_wallets"] = xmr_matches[:3]
                             except (PermissionError, OSError):
                                 pass
                             found_notes.append(note_info)
@@ -583,6 +752,17 @@ class IOCScanner:
                             fpath = os.path.join(dirpath, fname)
                             stat_info = safe_stat(fpath) or {"path": fpath}
                             stat_info["tool_name"] = fname
+                            stat_info["directory"] = dirpath
+                            # Hash the tool for attribution
+                            sha = hash_file(fpath, "sha256")
+                            if sha:
+                                stat_info["sha256"] = sha
+                            # Check if tool is currently running
+                            proc_list = get_system_cache().get_process_list()
+                            if proc_list and fname.lower() in proc_list.lower():
+                                stat_info["currently_running"] = True
+                            else:
+                                stat_info["currently_running"] = False
                             found_tools.append(stat_info)
             except (PermissionError, OSError):
                 continue
@@ -646,14 +826,22 @@ class PersistenceHunter:
             if rc == 0 and out:
                 for line in out.split("\n"):
                     line_lower = line.lower()
-                    # Flag entries in unusual locations
                     suspicious_indicators = [
                         "temp", "appdata", "perflog", "programdata",
                         "powershell", "cmd.exe /c", "mshta", "wscript", "cscript",
                         "rundll32", ".bat", ".vbs", ".ps1", ".hta",
                     ]
                     if any(ind in line_lower for ind in suspicious_indicators):
-                        suspicious_entries.append({"registry_path": rpath, "entry": line.strip()})
+                        # Parse REG_SZ / REG_EXPAND_SZ lines: "  ValueName    REG_SZ    ValueData"
+                        parts = re.split(r'\s{4,}', line.strip(), maxsplit=2)
+                        entry = {
+                            "registry_key": rpath,
+                            "value_name": parts[0].strip() if len(parts) >= 1 else "",
+                            "value_type": parts[1].strip() if len(parts) >= 2 else "",
+                            "value_data": parts[2].strip() if len(parts) >= 3 else line.strip(),
+                            "matched_indicator": next((ind for ind in suspicious_indicators if ind in line_lower), ""),
+                        }
+                        suspicious_entries.append(entry)
         
         if suspicious_entries:
             self.findings.append(Finding(
@@ -668,12 +856,27 @@ class PersistenceHunter:
         out, _, rc = run_cmd("schtasks /query /fo CSV /v 2>nul", timeout=30)
         if rc == 0 and out:
             suspicious_tasks = []
-            for line in out.split("\n"):
+            lines = out.split("\n")
+            # Parse CSV: first line is header
+            header = []
+            if lines:
+                header = [h.strip().strip('"') for h in lines[0].split(",")]
+            for line in lines[1:]:
                 line_lower = line.lower()
                 if any(t in line_lower for t in ["temp", "appdata", "perflog", "powershell -enc",
                                                   "cmd /c", "wscript", "cscript", ".bat", ".ps1"]):
-                    suspicious_tasks.append(line.strip())
-            
+                    fields = [f.strip().strip('"') for f in line.split(",")]
+                    task_entry = {}
+                    for i, h in enumerate(header):
+                        if i < len(fields):
+                            key = h.lower().replace(" ", "_")
+                            if key in ("taskname", "task_to_run", "start_in", "run_as_user",
+                                       "next_run_time", "last_run_time", "status", "schedule_type"):
+                                task_entry[key] = fields[i]
+                    if not task_entry:
+                        task_entry = {"raw_line": line.strip()}
+                    suspicious_tasks.append(task_entry)
+
             if suspicious_tasks:
                 self.findings.append(Finding(
                     self.MODULE,
@@ -709,12 +912,30 @@ class PersistenceHunter:
         # --- BITS Transfer Jobs ---
         out, _, rc = run_cmd("bitsadmin /list /allusers /verbose 2>nul", timeout=15)
         if rc == 0 and out and "GUID" in out:
+            # Parse BITS job details
+            bits_jobs = []
+            current_job: Dict[str, str] = {}
+            for line in out.split("\n"):
+                line = line.strip()
+                if line.startswith("GUID:"):
+                    if current_job:
+                        bits_jobs.append(current_job)
+                    current_job = {"guid": line.split(":", 1)[1].strip()}
+                elif ":" in line and current_job:
+                    key, _, val = line.partition(":")
+                    key = key.strip().lower().replace(" ", "_")
+                    if key in ("display_name", "type", "state", "owner", "priority",
+                               "files_total", "bytes_total", "bytes_transferred",
+                               "creation_time", "modification_time", "no_progress_timeout"):
+                        current_job[key] = val.strip()
+            if current_job:
+                bits_jobs.append(current_job)
             self.findings.append(Finding(
                 self.MODULE,
                 "BITS TRANSFER JOBS FOUND",
-                "Active BITS jobs detected - can be used for persistence and data exfiltration",
+                f"Found {len(bits_jobs)} active BITS jobs - can be used for persistence and data exfiltration",
                 severity=3, mitre_id="T1197",
-                evidence={"bits_output": out[:5000]},
+                evidence={"bits_jobs": bits_jobs[:20]},
             ))
 
         # --- New/Modified Services ---
@@ -728,7 +949,17 @@ class PersistenceHunter:
                 line_lower = line.lower()
                 if any(t in line_lower for t in ["temp", "appdata", "perflog", "powershell",
                                                   "cmd.exe", ".bat", "programdata"]):
-                    suspicious_svcs.append(line.strip())
+                    # Parse CSV: Node,Name,PathName,StartName
+                    fields = [f.strip() for f in line.split(",")]
+                    svc_entry = {
+                        "service_name": fields[1] if len(fields) > 1 else "",
+                        "executable_path": fields[2] if len(fields) > 2 else "",
+                        "run_as_account": fields[3] if len(fields) > 3 else "",
+                        "matched_indicator": next((t for t in ["temp", "appdata", "perflog", "powershell",
+                                                                "cmd.exe", ".bat", "programdata"]
+                                                   if t in line_lower), ""),
+                    }
+                    suspicious_svcs.append(svc_entry)
             if suspicious_svcs:
                 self.findings.append(Finding(
                     self.MODULE,
@@ -944,31 +1175,88 @@ class LateralMovementDetector:
             timeout=30
         )
         if rc == 0 and out and "Event" in out:
+            # Parse individual RDP sessions from text output
+            rdp_sessions = []
+            current_event: Dict[str, str] = {}
+            for line in out.split("\n"):
+                line = line.strip()
+                if line.startswith("Event["):
+                    if current_event:
+                        rdp_sessions.append(current_event)
+                    current_event = {}
+                elif ":" in line:
+                    key, _, val = line.partition(":")
+                    key = key.strip().lower()
+                    val = val.strip()
+                    if "date" in key or "time" in key:
+                        current_event["timestamp"] = val
+                    elif "user" in key:
+                        current_event["user"] = val
+                    elif "source" in key or "address" in key:
+                        current_event["source_ip"] = val
+                    elif "session" in key:
+                        current_event["session_id"] = val
+                    elif "event id" in key or "eventid" in key:
+                        current_event["event_id"] = val
+            if current_event:
+                rdp_sessions.append(current_event)
             self.findings.append(Finding(
                 self.MODULE,
                 "RDP INBOUND CONNECTIONS DETECTED",
-                "Recent RDP logon sessions detected - review for unauthorized access",
+                f"Found {len(rdp_sessions)} RDP logon/reconnection sessions — review for unauthorized access",
                 severity=3, mitre_id="T1021",
-                evidence={"rdp_events": out[:5000]},
+                evidence={"rdp_sessions": rdp_sessions[:50]},
             ))
-        
+
         # --- RDP Outbound (bitmap cache) ---
         bmc_path = os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\Terminal Server Client\Cache")
         if os.path.exists(bmc_path):
             cache_files = os.listdir(bmc_path)
             if cache_files:
+                # Also check MRU for destination servers
+                mru_servers = []
+                mru_out, _, mru_rc = run_cmd(
+                    r'reg query "HKCU\SOFTWARE\Microsoft\Terminal Server Client\Default" 2>nul'
+                )
+                if mru_rc == 0 and mru_out:
+                    for line in mru_out.split("\n"):
+                        if "MRU" in line and "REG_SZ" in line:
+                            parts = re.split(r'\s{4,}', line.strip(), maxsplit=2)
+                            if len(parts) >= 3:
+                                mru_servers.append(parts[2].strip())
                 self.findings.append(Finding(
                     self.MODULE,
                     "RDP OUTBOUND CACHE FOUND",
-                    f"RDP bitmap cache with {len(cache_files)} files - indicates outbound RDP",
+                    f"RDP bitmap cache with {len(cache_files)} files — indicates outbound RDP to {len(mru_servers)} host(s)",
                     severity=3, mitre_id="T1021",
-                    evidence={"cache_dir": bmc_path, "file_count": len(cache_files)},
+                    evidence={
+                        "cache_dir": bmc_path,
+                        "file_count": len(cache_files),
+                        "cache_files": cache_files[:30],
+                        "destination_servers_mru": mru_servers,
+                    },
                 ))
-        
+
         # --- SMB/Admin shares ---
         out, _, rc = run_cmd("net use 2>nul")
         if rc == 0 and out:
-            connections = [l.strip() for l in out.split("\n") if "\\\\" in l]
+            connections = []
+            for l in out.split("\n"):
+                if "\\\\" in l:
+                    parts = l.split()
+                    conn_entry = {"raw": l.strip()}
+                    # Try to extract UNC path and status
+                    for p in parts:
+                        if p.startswith("\\\\"):
+                            conn_entry["unc_path"] = p
+                            # Extract hostname/IP from UNC
+                            unc_parts = p.replace("\\\\", "").split("\\")
+                            if unc_parts:
+                                conn_entry["destination_host"] = unc_parts[0]
+                                conn_entry["share_name"] = unc_parts[1] if len(unc_parts) > 1 else ""
+                    if parts and parts[0] in ("OK", "Disconnected", "Unavailable"):
+                        conn_entry["status"] = parts[0]
+                    connections.append(conn_entry)
             if connections:
                 self.findings.append(Finding(
                     self.MODULE, "ACTIVE SMB/NETWORK CONNECTIONS",
@@ -994,7 +1282,15 @@ class LateralMovementDetector:
         psexec_indicators = []
         psexec_svc = os.path.expandvars(r"%SYSTEMROOT%\PSEXESVC.exe")
         if os.path.exists(psexec_svc):
-            psexec_indicators.append({"type": "psexesvc_binary", "path": psexec_svc})
+            svc_stat = safe_stat(psexec_svc)
+            svc_hash = hash_file(psexec_svc, "sha256")
+            psexec_indicators.append({
+                "type": "psexesvc_binary", "path": psexec_svc,
+                "sha256": svc_hash or "",
+                "created": svc_stat.get("created", "") if svc_stat else "",
+                "modified": svc_stat.get("modified", "") if svc_stat else "",
+                "size_bytes": svc_stat.get("size_bytes", 0) if svc_stat else 0,
+            })
         
         out, _, rc = run_cmd('sc query PSEXESVC 2>nul')
         if rc == 0 and "RUNNING" in out.upper():
@@ -1018,12 +1314,28 @@ class LateralMovementDetector:
             type3_count = len(re.findall(r'logon type:\s+3\b', out, re.I))
             type10_count = len(re.findall(r'logon type:\s+10\b', out, re.I))
             if type3_count > 0 or type10_count > 0:
+                # Extract source IPs and usernames from logon events
+                source_ips = defaultdict(int)
+                usernames = defaultdict(int)
+                for ip_match in re.finditer(r'source network address:\s*(\S+)', out, re.I):
+                    ip = ip_match.group(1)
+                    if ip and ip != "-":
+                        source_ips[ip] += 1
+                for user_match in re.finditer(r'account name:\s*(\S+)', out, re.I):
+                    user = user_match.group(1)
+                    if user and user != "-" and user.upper() not in ("SYSTEM", "LOCAL SERVICE",
+                                                                      "NETWORK SERVICE", "ANONYMOUS LOGON"):
+                        usernames[user] += 1
                 self.findings.append(Finding(
                     self.MODULE, "NETWORK/RDP LOGON EVENTS",
                     f"Found {type3_count} network logons (Type 3) and {type10_count} RDP logons (Type 10)",
                     severity=3, mitre_id="T1078",
-                    evidence={"type3_count": type3_count, "type10_count": type10_count,
-                              "raw_preview": out[:3000]},
+                    evidence={
+                        "type3_count": type3_count,
+                        "type10_count": type10_count,
+                        "source_ips": dict(source_ips),
+                        "logon_usernames": dict(usernames),
+                    },
                 ))
         
         return self.findings
@@ -1036,25 +1348,63 @@ class LateralMovementDetector:
         # --- SSH login history ---
         out, _, rc = run_cmd("last -i -n 50 2>/dev/null || last -n 50 2>/dev/null")
         if rc == 0 and out:
-            remote_logins = [l for l in out.split("\n") if l.strip() and "pts/" in l]
+            remote_logins = []
+            for l in out.split("\n"):
+                if l.strip() and "pts/" in l:
+                    parts = l.split()
+                    session = {
+                        "username": parts[0] if len(parts) > 0 else "",
+                        "terminal": parts[1] if len(parts) > 1 else "",
+                        "source_ip": parts[2] if len(parts) > 2 else "",
+                    }
+                    # Capture date portion (varies by OS)
+                    date_part = " ".join(parts[3:7]) if len(parts) > 6 else " ".join(parts[3:])
+                    session["login_time"] = date_part
+                    remote_logins.append(session)
             if remote_logins:
+                # Summarize source IPs
+                ip_counts = defaultdict(int)
+                for s in remote_logins:
+                    if s["source_ip"]:
+                        ip_counts[s["source_ip"]] += 1
                 self.findings.append(Finding(
                     self.MODULE, "SSH/REMOTE LOGIN HISTORY",
-                    f"Found {len(remote_logins)} remote terminal sessions",
+                    f"Found {len(remote_logins)} remote terminal sessions from {len(ip_counts)} unique source(s)",
                     severity=3, mitre_id="T1021",
-                    evidence={"sessions": remote_logins[:30]},
+                    evidence={"sessions": remote_logins[:30], "source_ip_summary": dict(ip_counts)},
                 ))
-        
+
         # --- Failed login attempts ---
         out, _, rc = run_cmd("lastb -n 50 2>/dev/null")
         if rc == 0 and out and len(out.strip()) > 10:
+            failed_entries = []
+            ip_counts = defaultdict(int)
+            user_counts = defaultdict(int)
+            for l in out.split("\n"):
+                if l.strip() and not l.startswith("btmp"):
+                    parts = l.split()
+                    entry = {
+                        "username": parts[0] if len(parts) > 0 else "",
+                        "terminal": parts[1] if len(parts) > 1 else "",
+                        "source_ip": parts[2] if len(parts) > 2 else "",
+                    }
+                    if entry["source_ip"]:
+                        ip_counts[entry["source_ip"]] += 1
+                    if entry["username"]:
+                        user_counts[entry["username"]] += 1
+                    failed_entries.append(entry)
             self.findings.append(Finding(
                 self.MODULE, "FAILED LOGIN ATTEMPTS",
-                "Failed login attempts detected - possible brute force",
+                f"Found {len(failed_entries)} failed login attempts from {len(ip_counts)} unique IP(s)",
                 severity=3, mitre_id="T1078",
-                evidence={"failed_logins": out[:3000]},
+                evidence={
+                    "failed_logins": failed_entries[:30],
+                    "source_ip_failure_counts": dict(ip_counts),
+                    "username_failure_counts": dict(user_counts),
+                    "total_failures": len(failed_entries),
+                },
             ))
-        
+
         # --- auth.log analysis ---
         auth_logs = ["/var/log/auth.log", "/var/log/secure"]
         for alog in auth_logs:
@@ -1062,14 +1412,41 @@ class LateralMovementDetector:
                 try:
                     out, _, rc = run_cmd(f"grep -i 'accepted\\|failed\\|invalid\\|sudo' {alog} | tail -100")
                     if out:
-                        accepted = [l for l in out.split("\n") if "accepted" in l.lower()]
-                        failed = [l for l in out.split("\n") if "failed" in l.lower()]
-                        sudo = [l for l in out.split("\n") if "sudo" in l.lower()]
+                        accepted = []
+                        failed = []
+                        sudo = []
+                        for line in out.split("\n"):
+                            # Parse: "Jan  5 14:23:01 host sshd[1234]: Accepted publickey for user from 1.2.3.4 port 22"
+                            entry = {"log_line": line.strip()}
+                            ip_match = re.search(r'from\s+(\d+\.\d+\.\d+\.\d+)', line)
+                            if ip_match:
+                                entry["source_ip"] = ip_match.group(1)
+                            user_match = re.search(r'for\s+(\S+)', line)
+                            if user_match:
+                                entry["username"] = user_match.group(1)
+                            port_match = re.search(r'port\s+(\d+)', line)
+                            if port_match:
+                                entry["source_port"] = port_match.group(1)
+                            # Timestamp is typically the first 15 chars
+                            if len(line) > 15:
+                                entry["timestamp"] = line[:15].strip()
+
+                            if "accepted" in line.lower():
+                                accepted.append(entry)
+                            elif "failed" in line.lower():
+                                failed.append(entry)
+                            if "sudo" in line.lower():
+                                sudo.append(entry)
                         self.findings.append(Finding(
                             self.MODULE, "AUTH LOG ANALYSIS",
-                            f"Accepted: {len(accepted)}, Failed: {len(failed)}, Sudo: {len(sudo)}",
+                            f"From {alog}: {len(accepted)} accepted, {len(failed)} failed, {len(sudo)} sudo",
                             severity=3, mitre_id="T1078",
-                            evidence={"accepted": accepted[:20], "failed": failed[:20], "sudo": sudo[:20]},
+                            evidence={
+                                "log_file": alog,
+                                "accepted_logins": accepted[:20],
+                                "failed_logins": failed[:20],
+                                "sudo_commands": sudo[:20],
+                            },
                         ))
                 except (PermissionError, OSError):
                     pass
@@ -1390,12 +1767,35 @@ class DefenseEvasionDetector:
             timeout=15
         )
         if rc == 0 and out and "1102" in out:
+            # Parse clearing events for timestamps and accounts
+            clear_events = []
+            current_event: Dict[str, str] = {}
+            for line in out.split("\n"):
+                line = line.strip()
+                if line.startswith("Event["):
+                    if current_event:
+                        clear_events.append(current_event)
+                    current_event = {"event_id": "1102"}
+                elif ":" in line:
+                    key, _, val = line.partition(":")
+                    key_lower = key.strip().lower()
+                    val = val.strip()
+                    if "date" in key_lower or "time" in key_lower:
+                        current_event["timestamp"] = val
+                    elif "account" in key_lower or "subject" in key_lower:
+                        current_event["cleared_by_account"] = val
+                    elif "domain" in key_lower:
+                        current_event["domain"] = val
+                    elif "logon id" in key_lower:
+                        current_event["logon_id"] = val
+            if current_event:
+                clear_events.append(current_event)
             self.findings.append(Finding(
                 self.MODULE,
                 "SECURITY LOG CLEARED (ANTI-FORENSICS)",
-                "Security event log clearing events detected (Event ID 1102)",
+                f"Found {len(clear_events)} security log clearing event(s) (Event ID 1102)",
                 severity=5, mitre_id="T1070",
-                evidence={"log_clear_events": out[:3000]},
+                evidence={"log_clear_events": clear_events},
             ))
         
         # --- Check if key event logs are empty/tiny ---
@@ -1405,9 +1805,17 @@ class DefenseEvasionDetector:
         for lc in log_channels:
             out, _, rc = run_cmd(f'wevtutil gli "{lc}" 2>nul')
             if rc == 0 and out:
-                match = re.search(r'numberOfLogRecords:\s*(\d+)', out, re.I)
-                if match and int(match.group(1)) < 50:
-                    empty_logs.append({"log": lc, "records": int(match.group(1))})
+                record_match = re.search(r'numberOfLogRecords:\s*(\d+)', out, re.I)
+                size_match = re.search(r'fileSize:\s*(\d+)', out, re.I)
+                records = int(record_match.group(1)) if record_match else -1
+                if records >= 0 and records < 50:
+                    log_entry: Dict[str, Any] = {
+                        "log_channel": lc,
+                        "record_count": records,
+                    }
+                    if size_match:
+                        log_entry["file_size_bytes"] = int(size_match.group(1))
+                    empty_logs.append(log_entry)
         
         if empty_logs:
             self.findings.append(Finding(
@@ -1787,36 +2195,44 @@ class CredentialArtifactHunter:
                 exe_link = f"/proc/{pid_dir}/exe"
                 try:
                     exe_path = os.readlink(exe_link)
-                    # Detect deleted binaries still running in memory
-                    if "(deleted)" in exe_path:
-                        cmdline_path = f"/proc/{pid_dir}/cmdline"
-                        cmdline = ""
-                        try:
-                            with open(cmdline_path, "r") as f:
-                                cmdline = f.read().replace("\x00", " ").strip()
-                        except (PermissionError, OSError):
-                            pass
-                        suspicious_procs.append({
+                    is_deleted = "(deleted)" in exe_path
+                    is_temp = any(loc in exe_path for loc in ["/tmp/", "/dev/shm/", "/var/tmp/"])
+                    if is_deleted or is_temp:
+                        proc_entry: Dict[str, Any] = {
                             "pid": pid_dir,
                             "exe": exe_path,
-                            "cmdline": cmdline,
-                            "issue": "Binary deleted from disk but still running",
-                        })
-                    # Detect execution from suspicious locations
-                    elif any(loc in exe_path for loc in ["/tmp/", "/dev/shm/", "/var/tmp/"]):
-                        cmdline_path = f"/proc/{pid_dir}/cmdline"
-                        cmdline = ""
+                            "issue": "Binary deleted from disk but still running" if is_deleted
+                                     else "Running from suspicious temp location",
+                        }
+                        # Command line
                         try:
-                            with open(cmdline_path, "r") as f:
-                                cmdline = f.read().replace("\x00", " ").strip()
+                            with open(f"/proc/{pid_dir}/cmdline", "r") as f:
+                                proc_entry["cmdline"] = f.read().replace("\x00", " ").strip()
+                        except (PermissionError, OSError):
+                            proc_entry["cmdline"] = ""
+                        # Parent PID
+                        try:
+                            with open(f"/proc/{pid_dir}/status", "r") as f:
+                                for sline in f:
+                                    if sline.startswith("PPid:"):
+                                        proc_entry["ppid"] = sline.split(":")[1].strip()
+                                    elif sline.startswith("Uid:"):
+                                        proc_entry["uid"] = sline.split(":")[1].strip().split()[0]
+                                    elif sline.startswith("Name:"):
+                                        proc_entry["process_name"] = sline.split(":")[1].strip()
                         except (PermissionError, OSError):
                             pass
-                        suspicious_procs.append({
-                            "pid": pid_dir,
-                            "exe": exe_path,
-                            "cmdline": cmdline,
-                            "issue": "Running from suspicious temp location",
-                        })
+                        # Open file descriptor count
+                        try:
+                            fd_dir = f"/proc/{pid_dir}/fd"
+                            proc_entry["open_fds"] = len(os.listdir(fd_dir))
+                        except (PermissionError, OSError):
+                            pass
+                        # Network connections from /proc/net (via cmdline)
+                        net_out, _, net_rc = run_cmd(f"ss -tnp | grep 'pid={pid_dir},' 2>/dev/null", timeout=5)
+                        if net_rc == 0 and net_out:
+                            proc_entry["network_connections"] = [l.strip() for l in net_out.split("\n") if l.strip()][:5]
+                        suspicious_procs.append(proc_entry)
                 except (PermissionError, OSError, FileNotFoundError):
                     continue
         except (PermissionError, OSError):
@@ -1998,20 +2414,44 @@ class LiveTriage:
         
         # --- Suspicious Processes ---
         out = get_system_cache().get_process_list()
-        
+
         suspicious_procs = []
         if out:
             for proc_name in NOVA_IOCS["suspicious_processes"]:
                 if proc_name.lower() in out.lower():
-                    # Extract the matching lines
                     matches = [l for l in out.split("\n") if proc_name.lower() in l.lower()]
-                    suspicious_procs.extend(matches[:5])
-        
+                    for match_line in matches[:5]:
+                        proc_entry: Dict[str, Any] = {
+                            "matched_tool": proc_name,
+                            "raw_line": match_line.strip(),
+                        }
+                        # Try to parse PID and other fields from ps/tasklist output
+                        parts = match_line.split()
+                        if os_type == "windows":
+                            # tasklist CSV: "Image Name","PID","Session Name","Session#","Mem Usage",...
+                            csv_parts = [p.strip('"') for p in match_line.split('","')]
+                            if len(csv_parts) >= 2:
+                                proc_entry["process_name"] = csv_parts[0]
+                                proc_entry["pid"] = csv_parts[1]
+                                if len(csv_parts) >= 5:
+                                    proc_entry["memory_usage"] = csv_parts[4]
+                        else:
+                            # ps aux: USER PID %CPU %MEM VSZ RSS TTY STAT START TIME COMMAND
+                            if len(parts) >= 11:
+                                proc_entry["user"] = parts[0]
+                                proc_entry["pid"] = parts[1]
+                                proc_entry["cpu_percent"] = parts[2]
+                                proc_entry["memory_percent"] = parts[3]
+                                proc_entry["start_time"] = parts[8]
+                                proc_entry["command"] = " ".join(parts[10:])
+                        suspicious_procs.append(proc_entry)
+
         if suspicious_procs:
+            tool_names = list(set(p["matched_tool"] for p in suspicious_procs))
             self.findings.append(Finding(
                 self.MODULE,
                 "SUSPICIOUS PROCESSES RUNNING",
-                f"Found {len(suspicious_procs)} suspicious processes currently running",
+                f"Found {len(suspicious_procs)} suspicious processes: {', '.join(tool_names)}",
                 severity=4, mitre_id="T1059",
                 evidence={"processes": suspicious_procs},
             ))
@@ -2032,16 +2472,26 @@ class LiveTriage:
         # Flag unusual listeners
         if out:
             unusual = []
+            suspicious_ports = {"4444", "5555", "6666", "8888", "9999", "1234", "31337", "9050"}
             for line in out.split("\n"):
-                # Common attacker reverse shell / C2 ports
-                for port in ["4444", "5555", "6666", "8888", "9999", "1234", "31337", "9050"]:
+                for port in suspicious_ports:
                     if f":{port}" in line:
-                        unusual.append(line.strip())
+                        listener = {"port": port, "raw_line": line.strip()}
+                        # Try to extract bind address and PID
+                        addr_match = re.search(r'(\S+):' + port, line)
+                        if addr_match:
+                            listener["bind_address"] = addr_match.group(1)
+                        pid_match = re.search(r'(?:pid[=,])(\d+)|(\d+)\s*$', line)
+                        if pid_match:
+                            listener["pid"] = pid_match.group(1) or pid_match.group(2)
+                        unusual.append(listener)
+                        break
             if unusual:
+                ports_found = list(set(u["port"] for u in unusual))
                 self.findings.append(Finding(
                     self.MODULE,
                     "UNUSUAL LISTENING PORTS",
-                    f"Found {len(unusual)} processes listening on suspicious ports",
+                    f"Found {len(unusual)} processes listening on suspicious ports: {', '.join(ports_found)}",
                     severity=4, mitre_id="T1059",
                     evidence={"listeners": unusual},
                 ))
@@ -2050,18 +2500,37 @@ class LiveTriage:
         if os_type == "windows":
             out, _, rc = run_cmd("ipconfig /displaydns 2>nul", timeout=15)
             if rc == 0 and out:
-                # Look for onion or suspicious domains
+                # Parse DNS cache into records: Record Name, Record Type, A (Host) Record
                 suspicious_dns = []
+                suspicious_domains = [".onion", "mega.nz", "mega.co", "anonfiles",
+                                       "transfer.sh", "gofile.io", "dropmefiles"]
+                current_record: Dict[str, str] = {}
                 for line in out.split("\n"):
-                    line_lower = line.lower()
-                    if any(d in line_lower for d in [".onion", "mega.nz", "mega.co", "anonfiles",
-                                                     "transfer.sh", "gofile.io", "dropmefiles"]):
-                        suspicious_dns.append(line.strip())
+                    line = line.strip()
+                    if "Record Name" in line:
+                        current_record = {"domain": line.split(":", 1)[1].strip() if ":" in line else ""}
+                    elif "Record Type" in line:
+                        current_record["record_type"] = line.split(":", 1)[1].strip() if ":" in line else ""
+                    elif "A (Host) Record" in line or "AAAA" in line:
+                        current_record["resolved_ip"] = line.split(":", 1)[1].strip() if ":" in line else ""
+                    elif "Time To Live" in line:
+                        current_record["ttl"] = line.split(":", 1)[1].strip() if ":" in line else ""
+                    elif line == "" and current_record.get("domain"):
+                        domain = current_record.get("domain", "").lower()
+                        if any(d in domain for d in suspicious_domains):
+                            suspicious_dns.append(current_record)
+                        current_record = {}
+                # Check the last record
+                if current_record.get("domain"):
+                    domain = current_record.get("domain", "").lower()
+                    if any(d in domain for d in suspicious_domains):
+                        suspicious_dns.append(current_record)
                 if suspicious_dns:
+                    domains_found = list(set(d.get("domain", "") for d in suspicious_dns))
                     self.findings.append(Finding(
                         self.MODULE,
                         "SUSPICIOUS DNS CACHE ENTRIES",
-                        f"Found {len(suspicious_dns)} suspicious domain resolutions in DNS cache",
+                        f"Found {len(suspicious_dns)} suspicious domain(s) in DNS cache: {', '.join(domains_found[:5])}",
                         severity=4, mitre_id="T1048",
                         evidence={"dns_entries": suspicious_dns},
                     ))
@@ -2077,6 +2546,865 @@ class LiveTriage:
     
     def run_all(self) -> List[Finding]:
         return self.triage()
+
+
+# ============================================================================
+# MODULE 8: EVTX ANALYZER (Offline Event Log Parsing)
+# ============================================================================
+
+class EVTXAnalyzer:
+    """Parse offline .evtx files and generate Nova-specific findings."""
+
+    MODULE = "EVTX_ANALYSIS"
+
+    # Nova-specific command patterns to detect in event logs
+    NOVA_CMD_PATTERNS = [
+        re.compile(r"rclone", re.I),
+        re.compile(r"mimikatz", re.I),
+        re.compile(r"psexec", re.I),
+        re.compile(r"sharphound", re.I),
+        re.compile(r"bloodhound", re.I),
+        re.compile(r"lazagne", re.I),
+        re.compile(r"chisel", re.I),
+        re.compile(r"ngrok", re.I),
+        re.compile(r"anydesk", re.I),
+        re.compile(r"megasync", re.I),
+        re.compile(r"netscan", re.I),
+        re.compile(r"advanced_ip_scanner", re.I),
+    ]
+
+    POWERSHELL_SUSPICIOUS = [
+        re.compile(r"invoke-expression", re.I),
+        re.compile(r"downloadstring", re.I),
+        re.compile(r"encodedcommand", re.I),
+        re.compile(r"set-mppreference", re.I),
+        re.compile(r"-disablerealtimemonitoring", re.I),
+        re.compile(r"vssadmin\s+(delete|resize)\s+shadows", re.I),
+        re.compile(r"wmic\s+shadowcopy\s+delete", re.I),
+        re.compile(r"bcdedit.*recoveryenabled.*no", re.I),
+        re.compile(r"rclone", re.I),
+        re.compile(r"invoke-mimikatz", re.I),
+        re.compile(r"sekurlsa", re.I),
+        re.compile(r"comsvcs\.dll", re.I),
+        re.compile(r"net\s+user\s+.*\/add", re.I),
+        re.compile(r"net\s+localgroup\s+admin", re.I),
+    ]
+
+    SUSPICIOUS_SERVICES = [
+        re.compile(r"temp", re.I),
+        re.compile(r"appdata", re.I),
+        re.compile(r"perflog", re.I),
+        re.compile(r"powershell", re.I),
+        re.compile(r"cmd\.exe", re.I),
+        re.compile(r"psexe", re.I),
+        re.compile(r"anydesk", re.I),
+        re.compile(r"splashtop", re.I),
+        re.compile(r"atera", re.I),
+    ]
+
+    EXFIL_DOMAINS = [
+        "mega.nz", "mega.co.nz", "anonfiles.com", "transfer.sh",
+        "gofile.io", "dropmefiles.com", "send.exploit.in",
+    ]
+
+    def __init__(self, evtx_paths: List[str], logger: logging.Logger):
+        self.logger = logger
+        self.findings: List[Finding] = []
+        self.evtx_files: List[str] = []
+
+        for p in evtx_paths:
+            if os.path.isdir(p):
+                for root, _, files in os.walk(p):
+                    for f in files:
+                        if f.lower().endswith(".evtx"):
+                            self.evtx_files.append(os.path.join(root, f))
+            elif os.path.isfile(p) and p.lower().endswith(".evtx"):
+                self.evtx_files.append(p)
+
+        if not self.evtx_files:
+            self.logger.warning("[EVTX] No .evtx files found in provided paths")
+
+    def _parse_evtx_file(self, path: str) -> List[Dict]:
+        """Parse a single .evtx file into a list of event dicts."""
+        events = []
+        try:
+            with evtx.Evtx(path) as log:
+                for record in log.records():
+                    try:
+                        xml_str = record.xml()
+                        evt = self._parse_event_xml(xml_str)
+                        if evt:
+                            evt["_source_file"] = path
+                            events.append(evt)
+                    except Exception:
+                        continue
+        except Exception as e:
+            self.logger.error(f"[EVTX] Failed to parse {path}: {e}")
+        return events
+
+    def _parse_event_xml(self, xml_str: str) -> Optional[Dict]:
+        """Extract fields from event XML into a flat dict."""
+        try:
+            root = ET.fromstring(xml_str)
+            ns = {"ns": "http://schemas.microsoft.com/win/2004/08/events/event"}
+
+            system = root.find("ns:System", ns)
+            if system is None:
+                return None
+
+            evt: Dict[str, Any] = {}
+            eid_el = system.find("ns:EventID", ns)
+            evt["EventID"] = int(eid_el.text) if eid_el is not None and eid_el.text else 0
+
+            tc_el = system.find("ns:TimeCreated", ns)
+            evt["TimeCreated"] = tc_el.get("SystemTime", "") if tc_el is not None else ""
+
+            provider_el = system.find("ns:Provider", ns)
+            evt["Provider"] = provider_el.get("Name", "") if provider_el is not None else ""
+
+            channel_el = system.find("ns:Channel", ns)
+            evt["Channel"] = channel_el.text if channel_el is not None and channel_el.text else ""
+
+            computer_el = system.find("ns:Computer", ns)
+            evt["Computer"] = computer_el.text if computer_el is not None and computer_el.text else ""
+
+            # Parse EventData
+            event_data = root.find("ns:EventData", ns)
+            if event_data is not None:
+                for data_el in event_data:
+                    name = data_el.get("Name", "")
+                    value = data_el.text or ""
+                    if name:
+                        evt[name] = value
+                    elif value:
+                        evt.setdefault("_data_values", []).append(value)
+
+            # Parse UserData if present
+            user_data = root.find("ns:UserData", ns)
+            if user_data is not None:
+                for child in user_data:
+                    for el in child:
+                        tag = el.tag.split("}")[-1] if "}" in el.tag else el.tag
+                        if el.text:
+                            evt[tag] = el.text
+
+            return evt
+        except ET.ParseError:
+            return None
+
+    def _classify_log(self, path: str, events: List[Dict]) -> str:
+        """Auto-detect log type from filename or content."""
+        basename = os.path.basename(path).lower()
+        if "security" in basename:
+            return "security"
+        if "system" in basename:
+            return "system"
+        if "powershell" in basename or "operational" in basename:
+            # Check if PowerShell by provider
+            if events:
+                provider = events[0].get("Provider", "")
+                if "powershell" in provider.lower():
+                    return "powershell"
+        if "sysmon" in basename:
+            return "sysmon"
+        if "terminalsession" in basename or "terminalservices" in basename or "rdp" in basename:
+            return "rdp"
+
+        # Classify by channel/provider from first event
+        if events:
+            channel = events[0].get("Channel", "").lower()
+            provider = events[0].get("Provider", "").lower()
+            if "security" in channel:
+                return "security"
+            if channel == "system":
+                return "system"
+            if "powershell" in channel or "powershell" in provider:
+                return "powershell"
+            if "sysmon" in provider or "sysmon" in channel:
+                return "sysmon"
+            if "terminalservices" in channel or "terminalservices" in provider:
+                return "rdp"
+
+        return "unknown"
+
+    def analyze_security_log(self, events: List[Dict]) -> List[Finding]:
+        """Analyze Windows Security event log events."""
+        findings = []
+
+        # EventID 1102: Audit log cleared
+        cleared = [e for e in events if e.get("EventID") == 1102]
+        if cleared:
+            findings.append(Finding(
+                self.MODULE, "SECURITY LOG CLEARED (EVTX)",
+                f"Found {len(cleared)} log-clearing events (EventID 1102) in offline EVTX",
+                severity=5, mitre_id="T1070",
+                evidence={"events": [{
+                    "time": e.get("TimeCreated"), "computer": e.get("Computer"),
+                    "cleared_by": e.get("SubjectUserName", "") or e.get("AccountName", ""),
+                    "domain": e.get("SubjectDomainName", ""),
+                } for e in cleared[:20]]},
+            ))
+
+        # EventID 4624: Successful logon
+        logons_4624 = [e for e in events if e.get("EventID") == 4624]
+        rdp_logons = [e for e in logons_4624 if e.get("LogonType") == "10"]
+        net_logons = [e for e in logons_4624 if e.get("LogonType") == "3"]
+
+        if rdp_logons:
+            evidence_list = []
+            for e in rdp_logons[:30]:
+                evidence_list.append({
+                    "time": e.get("TimeCreated"), "user": e.get("TargetUserName", ""),
+                    "source_ip": e.get("IpAddress", ""), "computer": e.get("Computer", ""),
+                })
+            findings.append(Finding(
+                self.MODULE, "RDP LOGONS DETECTED (EVTX)",
+                f"Found {len(rdp_logons)} RDP logon events (Type 10) in Security log",
+                severity=4, mitre_id="T1021",
+                evidence={"rdp_logons": evidence_list, "total": len(rdp_logons)},
+            ))
+
+        if net_logons:
+            evidence_list = []
+            for e in net_logons[:30]:
+                evidence_list.append({
+                    "time": e.get("TimeCreated"), "user": e.get("TargetUserName", ""),
+                    "source_ip": e.get("IpAddress", ""), "computer": e.get("Computer", ""),
+                })
+            findings.append(Finding(
+                self.MODULE, "NETWORK LOGONS DETECTED (EVTX)",
+                f"Found {len(net_logons)} network logon events (Type 3) in Security log",
+                severity=3, mitre_id="T1021",
+                evidence={"net_logons": evidence_list, "total": len(net_logons)},
+            ))
+
+        # EventID 4625: Failed logons (brute force)
+        failed = [e for e in events if e.get("EventID") == 4625]
+        if len(failed) >= 10:
+            src_ips = defaultdict(int)
+            targeted_users = defaultdict(int)
+            timestamps = []
+            for e in failed:
+                ip = e.get("IpAddress", "unknown")
+                src_ips[ip] += 1
+                user = e.get("TargetUserName", "unknown")
+                targeted_users[user] += 1
+                ts = e.get("TimeCreated", "")
+                if ts:
+                    timestamps.append(ts)
+            timestamps.sort()
+            findings.append(Finding(
+                self.MODULE, "BRUTE FORCE ATTEMPT DETECTED (EVTX)",
+                f"Found {len(failed)} failed logon events (EventID 4625) from {len(src_ips)} source IP(s) "
+                f"targeting {len(targeted_users)} account(s)",
+                severity=4, mitre_id="T1110",
+                evidence={
+                    "total_failures": len(failed),
+                    "source_ips": dict(src_ips),
+                    "targeted_usernames": dict(targeted_users),
+                    "first_attempt": timestamps[0] if timestamps else "",
+                    "last_attempt": timestamps[-1] if timestamps else "",
+                },
+            ))
+
+        # EventID 4688: Process creation
+        procs = [e for e in events if e.get("EventID") == 4688]
+        nova_procs = []
+        for e in procs:
+            cmdline = e.get("CommandLine", "") or e.get("NewProcessName", "")
+            for pat in self.NOVA_CMD_PATTERNS:
+                if pat.search(cmdline):
+                    nova_procs.append({
+                        "time": e.get("TimeCreated"), "command": cmdline,
+                        "user": e.get("SubjectUserName", ""), "matched": pat.pattern,
+                    })
+                    break
+        if nova_procs:
+            findings.append(Finding(
+                self.MODULE, "NOVA TOOL EXECUTION DETECTED (EVTX)",
+                f"Found {len(nova_procs)} process creation events matching Nova affiliate tools",
+                severity=5, mitre_id="T1059",
+                evidence={"processes": nova_procs[:50]},
+            ))
+
+        # EventID 4697: Service installed
+        svc_installs = [e for e in events if e.get("EventID") == 4697]
+        if svc_installs:
+            svc_list = []
+            for e in svc_installs:
+                svc_list.append({
+                    "time": e.get("TimeCreated"), "service": e.get("ServiceName", ""),
+                    "path": e.get("ServiceFileName", ""), "account": e.get("ServiceAccount", ""),
+                })
+            findings.append(Finding(
+                self.MODULE, "SERVICE INSTALLED (EVTX)",
+                f"Found {len(svc_installs)} service installation events (EventID 4697)",
+                severity=4, mitre_id="T1543",
+                evidence={"services": svc_list[:30]},
+            ))
+
+        # EventID 4698: Scheduled task created
+        schtasks = [e for e in events if e.get("EventID") == 4698]
+        if schtasks:
+            task_list = []
+            for e in schtasks:
+                task_list.append({
+                    "time": e.get("TimeCreated"), "task_name": e.get("TaskName", ""),
+                    "content": e.get("TaskContent", "")[:500],
+                })
+            findings.append(Finding(
+                self.MODULE, "SCHEDULED TASK CREATED (EVTX)",
+                f"Found {len(schtasks)} scheduled task creation events (EventID 4698)",
+                severity=4, mitre_id="T1053",
+                evidence={"tasks": task_list[:30]},
+            ))
+
+        # EventID 4720: Account created
+        new_accounts = [e for e in events if e.get("EventID") == 4720]
+        if new_accounts:
+            acct_list = []
+            for e in new_accounts:
+                acct_list.append({
+                    "time": e.get("TimeCreated"), "new_user": e.get("TargetUserName", ""),
+                    "created_by": e.get("SubjectUserName", ""),
+                })
+            findings.append(Finding(
+                self.MODULE, "USER ACCOUNT CREATED (EVTX)",
+                f"Found {len(new_accounts)} account creation events (EventID 4720)",
+                severity=4, mitre_id="T1136",
+                evidence={"accounts": acct_list[:30]},
+            ))
+
+        # EventID 4732: User added to admin group
+        group_adds = [e for e in events if e.get("EventID") == 4732]
+        if group_adds:
+            adds_list = []
+            for e in group_adds:
+                adds_list.append({
+                    "time": e.get("TimeCreated"),
+                    "member": e.get("MemberName", "") or e.get("MemberSid", ""),
+                    "group": e.get("TargetUserName", ""),
+                    "added_by": e.get("SubjectUserName", ""),
+                })
+            findings.append(Finding(
+                self.MODULE, "USER ADDED TO GROUP (EVTX)",
+                f"Found {len(group_adds)} group membership change events (EventID 4732)",
+                severity=4, mitre_id="T1098",
+                evidence={"group_changes": adds_list[:30]},
+            ))
+
+        return findings
+
+    def analyze_system_log(self, events: List[Dict]) -> List[Finding]:
+        """Analyze Windows System event log events."""
+        findings = []
+
+        # EventID 7045: New service installed
+        new_svcs = [e for e in events if e.get("EventID") == 7045]
+        suspicious_svcs = []
+        for e in new_svcs:
+            svc_name = e.get("ServiceName", "")
+            svc_path = e.get("ImagePath", "")
+            combined = f"{svc_name} {svc_path}"
+            for pat in self.SUSPICIOUS_SERVICES:
+                if pat.search(combined):
+                    suspicious_svcs.append({
+                        "time": e.get("TimeCreated"), "service": svc_name,
+                        "path": svc_path, "account": e.get("AccountName", ""),
+                    })
+                    break
+
+        if suspicious_svcs:
+            findings.append(Finding(
+                self.MODULE, "SUSPICIOUS SERVICE INSTALLED (EVTX)",
+                f"Found {len(suspicious_svcs)} suspicious new services (EventID 7045)",
+                severity=4, mitre_id="T1543",
+                evidence={"services": suspicious_svcs[:30]},
+            ))
+        elif new_svcs:
+            svc_list = []
+            for e in new_svcs[:20]:
+                svc_list.append({
+                    "time": e.get("TimeCreated"), "service": e.get("ServiceName", ""),
+                    "path": e.get("ImagePath", ""),
+                })
+            findings.append(Finding(
+                self.MODULE, "NEW SERVICES INSTALLED (EVTX)",
+                f"Found {len(new_svcs)} new service installations (EventID 7045)",
+                severity=2, mitre_id="T1543",
+                evidence={"services": svc_list},
+            ))
+
+        # EventID 7036: Service state change — look for security services stopped
+        state_changes = [e for e in events if e.get("EventID") == 7036]
+        security_stopped = []
+        security_svc_names = ["windows defender", "mpssvc", "windefend", "sense",
+                              "wscsvc", "securityhealthservice", "wuauserv"]
+        for e in state_changes:
+            param1 = (e.get("param1", "") or "").lower()
+            param2 = (e.get("param2", "") or "").lower()
+            if any(s in param1 for s in security_svc_names) and "stopped" in param2:
+                security_stopped.append({
+                    "time": e.get("TimeCreated"), "service": e.get("param1", ""),
+                    "state": e.get("param2", ""),
+                })
+
+        if security_stopped:
+            findings.append(Finding(
+                self.MODULE, "SECURITY SERVICE STOPPED (EVTX)",
+                f"Found {len(security_stopped)} security service stop events",
+                severity=5, mitre_id="T1562",
+                evidence={"stopped": security_stopped[:30]},
+            ))
+
+        return findings
+
+    def analyze_powershell_log(self, events: List[Dict]) -> List[Finding]:
+        """Analyze PowerShell Operational event log events."""
+        findings = []
+
+        # EventID 4104: Script block logging
+        script_blocks = [e for e in events if e.get("EventID") == 4104]
+        suspicious_blocks = []
+        for e in script_blocks:
+            script_text = e.get("ScriptBlockText", "") or e.get("_data_values", [""])[0] if e.get("_data_values") else ""
+            if not script_text:
+                continue
+            for pat in self.POWERSHELL_SUSPICIOUS:
+                if pat.search(script_text):
+                    suspicious_blocks.append({
+                        "time": e.get("TimeCreated"),
+                        "matched_pattern": pat.pattern,
+                        "matched_content_snippet": script_text[:200],
+                    })
+                    break
+
+        if suspicious_blocks:
+            findings.append(Finding(
+                self.MODULE, "SUSPICIOUS POWERSHELL SCRIPTS (EVTX)",
+                f"Found {len(suspicious_blocks)} suspicious PowerShell script blocks (EventID 4104)",
+                severity=5, mitre_id="T1059",
+                evidence={"script_blocks": suspicious_blocks[:50]},
+            ))
+
+        return findings
+
+    def analyze_sysmon_log(self, events: List[Dict]) -> List[Finding]:
+        """Analyze Sysmon event log events."""
+        findings = []
+
+        # EventID 1: Process creation
+        proc_creates = [e for e in events if e.get("EventID") == 1]
+        nova_procs = []
+        for e in proc_creates:
+            cmdline = e.get("CommandLine", "") or e.get("Image", "")
+            for pat in self.NOVA_CMD_PATTERNS:
+                if pat.search(cmdline):
+                    nova_procs.append({
+                        "time": e.get("TimeCreated"), "image": e.get("Image", ""),
+                        "commandline": (e.get("CommandLine", "") or "")[:300],
+                        "user": e.get("User", ""), "parent": e.get("ParentImage", ""),
+                        "hashes": e.get("Hashes", ""),
+                    })
+                    break
+
+        # Check hashes against known Nova hashes
+        known_hashes = set()
+        for h in NOVA_IOCS["sha256_hashes"]:
+            known_hashes.add(h.lower())
+        for h in NOVA_IOCS["md5_hashes"]:
+            known_hashes.add(h.lower())
+
+        hash_matches = []
+        for e in proc_creates:
+            hashes_str = e.get("Hashes", "")
+            if hashes_str:
+                for h_part in hashes_str.split(","):
+                    h_val = h_part.split("=")[-1].strip().lower() if "=" in h_part else h_part.strip().lower()
+                    if h_val in known_hashes:
+                        hash_matches.append({
+                            "time": e.get("TimeCreated"), "image": e.get("Image", ""),
+                            "hash_match": h_val, "full_hashes": hashes_str,
+                        })
+                        break
+
+        if hash_matches:
+            findings.append(Finding(
+                self.MODULE, "NOVA MALWARE HASH MATCH IN SYSMON (EVTX)",
+                f"Found {len(hash_matches)} process(es) matching known Nova hashes",
+                severity=5, mitre_id="T1486",
+                evidence={"hash_matches": hash_matches[:20]},
+            ))
+
+        if nova_procs:
+            findings.append(Finding(
+                self.MODULE, "NOVA TOOL EXECUTION IN SYSMON (EVTX)",
+                f"Found {len(nova_procs)} processes matching Nova affiliate tools in Sysmon",
+                severity=5, mitre_id="T1059",
+                evidence={"processes": nova_procs[:50]},
+            ))
+
+        # EventID 3: Network connection — match C2 IPs
+        net_conns = [e for e in events if e.get("EventID") == 3]
+        c2_ips = set(NOVA_IOCS.get("c2_ips", []))
+        c2_hits = []
+        for e in net_conns:
+            dest_ip = e.get("DestinationIp", "")
+            if dest_ip in c2_ips:
+                c2_hits.append({
+                    "time": e.get("TimeCreated"), "image": e.get("Image", ""),
+                    "dest_ip": dest_ip, "dest_port": e.get("DestinationPort", ""),
+                    "user": e.get("User", ""),
+                })
+
+        if c2_hits:
+            findings.append(Finding(
+                self.MODULE, "CONNECTION TO NOVA C2 IP IN SYSMON (EVTX)",
+                f"Found {len(c2_hits)} connections to known Nova C2 IPs in Sysmon logs",
+                severity=5, mitre_id="T1071",
+                evidence={"c2_connections": c2_hits[:30]},
+            ))
+
+        # EventID 11: File creation — .ralord, .nova, ransom notes
+        file_creates = [e for e in events if e.get("EventID") == 11]
+        nova_files = []
+        ext_set = set(e.lower() for e in NOVA_IOCS["file_extensions"])
+        note_names = set(n.lower() for n in NOVA_IOCS["ransom_note_names"])
+        note_pattern = re.compile(NOVA_IOCS.get("ransom_note_pattern", ""), re.I) if NOVA_IOCS.get("ransom_note_pattern") else None
+
+        for e in file_creates:
+            target = e.get("TargetFilename", "")
+            if not target:
+                continue
+            fname = os.path.basename(target).lower()
+            _, ext = os.path.splitext(fname)
+            if ext in ext_set or fname in note_names or (note_pattern and note_pattern.match(os.path.basename(target))):
+                nova_files.append({
+                    "time": e.get("TimeCreated"), "file": target,
+                    "image": e.get("Image", ""),
+                })
+
+        if nova_files:
+            findings.append(Finding(
+                self.MODULE, "NOVA ENCRYPTED FILES / RANSOM NOTES IN SYSMON (EVTX)",
+                f"Found {len(nova_files)} Nova-related file creation events in Sysmon",
+                severity=5, mitre_id="T1486",
+                evidence={"files": nova_files[:50]},
+            ))
+
+        # EventID 13: Registry value set (persistence keys)
+        reg_sets = [e for e in events if e.get("EventID") == 13]
+        persistence_keys = []
+        persist_patterns = [
+            re.compile(r"currentversion\\run", re.I),
+            re.compile(r"currentversion\\runonce", re.I),
+            re.compile(r"winlogon\\shell", re.I),
+            re.compile(r"winlogon\\userinit", re.I),
+            re.compile(r"policies\\explorer\\run", re.I),
+        ]
+        for e in reg_sets:
+            target_obj = e.get("TargetObject", "")
+            for pat in persist_patterns:
+                if pat.search(target_obj):
+                    persistence_keys.append({
+                        "time": e.get("TimeCreated"), "key": target_obj,
+                        "details": e.get("Details", ""), "image": e.get("Image", ""),
+                    })
+                    break
+
+        if persistence_keys:
+            findings.append(Finding(
+                self.MODULE, "REGISTRY PERSISTENCE MODIFIED IN SYSMON (EVTX)",
+                f"Found {len(persistence_keys)} registry persistence modifications",
+                severity=4, mitre_id="T1547",
+                evidence={"registry_keys": persistence_keys[:30]},
+            ))
+
+        # EventID 22: DNS query — onion, mega.nz, exfil domains
+        dns_queries = [e for e in events if e.get("EventID") == 22]
+        suspicious_dns = []
+        onion_domains = set(d.lower() for d in NOVA_IOCS.get("onion_domains", []))
+        for e in dns_queries:
+            query_name = (e.get("QueryName", "") or "").lower()
+            is_suspicious = False
+            if ".onion" in query_name:
+                is_suspicious = True
+            elif query_name in onion_domains:
+                is_suspicious = True
+            elif any(d in query_name for d in self.EXFIL_DOMAINS):
+                is_suspicious = True
+            if is_suspicious:
+                suspicious_dns.append({
+                    "time": e.get("TimeCreated"), "query": e.get("QueryName", ""),
+                    "image": e.get("Image", ""),
+                })
+
+        if suspicious_dns:
+            findings.append(Finding(
+                self.MODULE, "SUSPICIOUS DNS QUERIES IN SYSMON (EVTX)",
+                f"Found {len(suspicious_dns)} suspicious DNS queries (onion/exfil domains)",
+                severity=4, mitre_id="T1048",
+                evidence={"dns_queries": suspicious_dns[:30]},
+            ))
+
+        return findings
+
+    def analyze_rdp_log(self, events: List[Dict]) -> List[Finding]:
+        """Analyze RDP/Terminal Services event log events."""
+        findings = []
+
+        # EventID 21: RDP session logon
+        rdp_logons = [e for e in events if e.get("EventID") == 21]
+        if rdp_logons:
+            logon_list = []
+            for e in rdp_logons:
+                logon_list.append({
+                    "time": e.get("TimeCreated"), "user": e.get("User", ""),
+                    "source": e.get("Address", "") or e.get("Source", ""),
+                    "session_id": e.get("SessionID", ""),
+                })
+            findings.append(Finding(
+                self.MODULE, "RDP SESSION LOGONS (EVTX)",
+                f"Found {len(rdp_logons)} RDP session logon events (EventID 21)",
+                severity=3, mitre_id="T1021",
+                evidence={"rdp_logons": logon_list[:30]},
+            ))
+
+        # EventID 25: RDP reconnection
+        rdp_reconnects = [e for e in events if e.get("EventID") == 25]
+        if rdp_reconnects:
+            recon_list = []
+            for e in rdp_reconnects:
+                recon_list.append({
+                    "time": e.get("TimeCreated"), "user": e.get("User", ""),
+                    "source": e.get("Address", "") or e.get("Source", ""),
+                    "session_id": e.get("SessionID", ""),
+                })
+            findings.append(Finding(
+                self.MODULE, "RDP SESSION RECONNECTIONS (EVTX)",
+                f"Found {len(rdp_reconnects)} RDP reconnection events (EventID 25)",
+                severity=3, mitre_id="T1021",
+                evidence={"rdp_reconnections": recon_list[:30]},
+            ))
+
+        return findings
+
+    def run_all(self) -> List[Finding]:
+        """Parse all EVTX files and route to appropriate analyzers."""
+        if not HAS_EVTX:
+            self.logger.error("[EVTX] python-evtx is not installed. Install with: pip install python-evtx")
+            self.findings.append(Finding(
+                self.MODULE, "EVTX PARSER NOT AVAILABLE",
+                "python-evtx library is not installed — cannot parse .evtx files. "
+                "Install with: pip install python-evtx",
+                severity=1,
+            ))
+            return self.findings
+
+        self.logger.info(f"[EVTX] Analyzing {len(self.evtx_files)} .evtx file(s)...")
+
+        for evtx_path in self.evtx_files:
+            self.logger.info(f"[EVTX] Parsing: {evtx_path}")
+            events = self._parse_evtx_file(evtx_path)
+            if not events:
+                self.logger.warning(f"[EVTX] No events parsed from {evtx_path}")
+                continue
+
+            self.logger.info(f"[EVTX]   -> {len(events)} events parsed")
+            log_type = self._classify_log(evtx_path, events)
+            self.logger.info(f"[EVTX]   -> Classified as: {log_type}")
+
+            if log_type == "security":
+                self.findings.extend(self.analyze_security_log(events))
+            elif log_type == "system":
+                self.findings.extend(self.analyze_system_log(events))
+            elif log_type == "powershell":
+                self.findings.extend(self.analyze_powershell_log(events))
+            elif log_type == "sysmon":
+                self.findings.extend(self.analyze_sysmon_log(events))
+            elif log_type == "rdp":
+                self.findings.extend(self.analyze_rdp_log(events))
+            else:
+                # Try all analyzers for unknown logs
+                self.logger.info(f"[EVTX]   -> Unknown log type, running all analyzers")
+                self.findings.extend(self.analyze_security_log(events))
+                self.findings.extend(self.analyze_system_log(events))
+                self.findings.extend(self.analyze_powershell_log(events))
+                self.findings.extend(self.analyze_sysmon_log(events))
+                self.findings.extend(self.analyze_rdp_log(events))
+
+        self.logger.info(f"[EVTX] Analysis complete: {len(self.findings)} findings from EVTX files")
+        return self.findings
+
+
+# ============================================================================
+# NOVA CONFIDENCE SCORER
+# ============================================================================
+
+class NovaConfidenceScorer:
+    """Cross-correlate ALL findings to produce a definitive Nova attribution score."""
+
+    MODULE = "NOVA_ATTRIBUTION"
+
+    WEIGHTS = {
+        "hash_match": 40,
+        "encryption_extension": 15,
+        "ransom_note_content": 15,
+        "c2_connection": 20,
+        "tool_signature": 5,
+        "shadow_deletion": 5,
+        "defender_disabled": 5,
+        "rust_payload": 10,
+        "exfil_rclone_mega": 5,
+        "lateral_rdp_psexec": 5,
+        "evtx_nova_commands": 10,
+    }
+    # Max possible: 135
+    # Thresholds:
+    #   >= 60: CONFIRMED Nova
+    #   40-59: HIGHLY LIKELY Nova
+    #   20-39: POSSIBLE Nova (needs investigation)
+    #   < 20:  INSUFFICIENT EVIDENCE
+
+    TITLE_PATTERNS = {
+        "hash_match": [
+            re.compile(r"KNOWN NOVA MALWARE", re.I),
+            re.compile(r"NOVA.*HASH MATCH", re.I),
+        ],
+        "encryption_extension": [
+            re.compile(r"ENCRYPTED FILES DETECTED", re.I),
+            re.compile(r"NOVA ENCRYPTED FILES", re.I),
+        ],
+        "ransom_note_content": [
+            re.compile(r"RANSOM NOTE.*CONFIRMED NOVA", re.I),
+            re.compile(r"RANSOM NOTE", re.I),
+        ],
+        "c2_connection": [
+            re.compile(r"NOVA C2", re.I),
+            re.compile(r"C2 IP", re.I),
+        ],
+        "tool_signature": [
+            re.compile(r"SUSPICIOUS.*TOOLS", re.I),
+            re.compile(r"NOVA TOOL EXECUTION", re.I),
+        ],
+        "shadow_deletion": [
+            re.compile(r"SHADOW COP", re.I),
+            re.compile(r"BACKUP DESTRUCTION", re.I),
+            re.compile(r"INHIBIT.*RECOVERY", re.I),
+        ],
+        "defender_disabled": [
+            re.compile(r"DEFENDER TAMPERED", re.I),
+            re.compile(r"TAMPER PROTECTION DISABLED", re.I),
+            re.compile(r"SECURITY SERVICE STOPPED", re.I),
+            re.compile(r"GATEKEEPER DISABLED", re.I),
+            re.compile(r"SIP DISABLED", re.I),
+        ],
+        "exfil_rclone_mega": [
+            re.compile(r"RCLONE", re.I),
+            re.compile(r"EXFILTRATION TOOL", re.I),
+        ],
+        "lateral_rdp_psexec": [
+            re.compile(r"PSEXEC", re.I),
+            re.compile(r"RDP.*LOGON", re.I),
+            re.compile(r"RDP.*CONNECTION", re.I),
+            re.compile(r"LATERAL", re.I),
+        ],
+        "evtx_nova_commands": [
+            re.compile(r"SUSPICIOUS POWERSHELL", re.I),
+            re.compile(r"NOVA.*SYSMON", re.I),
+            re.compile(r"EVTX.*NOVA", re.I),
+            re.compile(r"NOVA.*EVTX", re.I),
+        ],
+    }
+
+    def __init__(self):
+        self.result: Optional[Dict] = None
+
+    def score(self, findings: List[Finding]) -> Dict:
+        """Iterate findings, match to weight categories, compute attribution score."""
+        matched_categories: Dict[str, List[str]] = defaultdict(list)
+
+        for f in findings:
+            title = f.title
+            desc = f.description
+            combined = f"{title} {desc}"
+
+            for category, patterns in self.TITLE_PATTERNS.items():
+                for pat in patterns:
+                    if pat.search(combined):
+                        matched_categories[category].append(title)
+                        break
+
+            # Special: check for Rust-based payload indicators
+            evidence = f.evidence if isinstance(f.evidence, dict) else {}
+            for mf in evidence.get("matched_files", []):
+                if isinstance(mf, dict):
+                    path = mf.get("path", "").lower()
+                    if any(ext in path for ext in [".exe", ""]):
+                        # Hash match already covers this, but check for Rust indicators
+                        pass
+
+        # Compute score
+        score = 0
+        max_possible = sum(self.WEIGHTS.values())
+        evidence_breakdown = {}
+
+        for category, weight in self.WEIGHTS.items():
+            if category in matched_categories:
+                score += weight
+                evidence_breakdown[category] = {
+                    "weight": weight,
+                    "matched": True,
+                    "evidence_count": len(matched_categories[category]),
+                    "samples": matched_categories[category][:3],
+                }
+            else:
+                evidence_breakdown[category] = {
+                    "weight": weight,
+                    "matched": False,
+                    "evidence_count": 0,
+                    "samples": [],
+                }
+
+        # Determine confidence level
+        if score >= 60:
+            confidence_level = "CONFIRMED NOVA"
+        elif score >= 40:
+            confidence_level = "HIGHLY LIKELY NOVA"
+        elif score >= 20:
+            confidence_level = "POSSIBLE NOVA"
+        else:
+            confidence_level = "INSUFFICIENT EVIDENCE"
+
+        self.result = {
+            "score": score,
+            "max_possible": max_possible,
+            "percentage": round((score / max_possible) * 100, 1) if max_possible > 0 else 0,
+            "confidence_level": confidence_level,
+            "categories_matched": len(matched_categories),
+            "categories_total": len(self.WEIGHTS),
+            "evidence_breakdown": evidence_breakdown,
+        }
+        return self.result
+
+    def generate_attribution_finding(self) -> Finding:
+        """Create a summary Finding with the confidence assessment."""
+        if self.result is None:
+            return Finding(
+                self.MODULE, "NOVA ATTRIBUTION NOT SCORED",
+                "Confidence scorer was not run", severity=1,
+            )
+
+        r = self.result
+        sev = 5 if r["score"] >= 60 else 4 if r["score"] >= 40 else 3 if r["score"] >= 20 else 1
+        return Finding(
+            self.MODULE,
+            f"NOVA ATTRIBUTION: {r['confidence_level']}",
+            f"Score: {r['score']}/{r['max_possible']} ({r['percentage']}%) — "
+            f"{r['categories_matched']}/{r['categories_total']} evidence categories matched",
+            severity=sev,
+            evidence=r,
+        )
 
 
 # ============================================================================
@@ -2150,13 +3478,15 @@ class TimelineBuilder:
 
 class ReportGenerator:
     """Generate human-readable and machine-readable reports."""
-    
+
     def __init__(self, findings: List[Finding], timeline: List[Dict],
-                 output_dir: str, logger: logging.Logger):
+                 output_dir: str, logger: logging.Logger,
+                 os_info: Optional[Dict[str, str]] = None):
         self.findings = findings
         self.timeline = timeline
         self.output_dir = output_dir
         self.logger = logger
+        self.os_info = os_info or get_os_info()
     
     def generate_all(self):
         self.generate_json()
@@ -2170,8 +3500,13 @@ class ReportGenerator:
                 "tool": "Nova/RALord IR Toolkit",
                 "version": "2.0",
                 "generated_at": datetime.now(timezone.utc).isoformat(),
-                "hostname": socket.gethostname(),
-                "os": platform.platform(),
+                "hostname": self.os_info.get("hostname", socket.gethostname()),
+                "os_type": self.os_info.get("os_type", ""),
+                "os_distribution": self.os_info.get("distribution", ""),
+                "os_version": self.os_info.get("version", ""),
+                "os_architecture": self.os_info.get("architecture", ""),
+                "os_kernel": self.os_info.get("kernel", ""),
+                "os_platform": self.os_info.get("platform", platform.platform()),
                 "threat_group": "Nova RaaS (formerly RALord)",
             },
             "executive_summary": self._exec_summary(),
@@ -2209,8 +3544,11 @@ class ReportGenerator:
             f.write("=" * 80 + "\n")
             f.write(" NOVA (RALord) RANSOMWARE - INCIDENT RESPONSE REPORT\n")
             f.write(f" Generated: {datetime.now(timezone.utc).isoformat()}\n")
-            f.write(f" Host:      {socket.gethostname()}\n")
-            f.write(f" OS:        {platform.platform()}\n")
+            f.write(f" Host:      {self.os_info.get('hostname', socket.gethostname())}\n")
+            f.write(f" OS:        {self.os_info.get('distribution', platform.platform())}\n")
+            f.write(f" Arch:      {self.os_info.get('architecture', '')}\n")
+            if self.os_info.get("kernel"):
+                f.write(f" Kernel:    {self.os_info['kernel']}\n")
             f.write("=" * 80 + "\n\n")
             
             summary = self._exec_summary()
@@ -2315,6 +3653,344 @@ class ReportGenerator:
 
 
 # ============================================================================
+# MITRE ATT&CK REPORT GENERATOR
+# ============================================================================
+
+MITRE_TACTICS = {
+    "TA0001": {"name": "Initial Access", "techniques": ["T1078", "T1133", "T1566", "T1204"]},
+    "TA0002": {"name": "Execution", "techniques": ["T1059", "T1106"]},
+    "TA0003": {"name": "Persistence", "techniques": ["T1053", "T1543", "T1546", "T1547", "T1574", "T1197"]},
+    "TA0004": {"name": "Privilege Escalation", "techniques": ["T1068", "T1055"]},
+    "TA0005": {"name": "Defense Evasion", "techniques": ["T1027", "T1070", "T1112", "T1497", "T1562"]},
+    "TA0006": {"name": "Credential Access", "techniques": ["T1003", "T1110", "T1550"]},
+    "TA0007": {"name": "Discovery", "techniques": ["T1012", "T1018", "T1082", "T1083"]},
+    "TA0008": {"name": "Lateral Movement", "techniques": ["T1021", "T1570"]},
+    "TA0009": {"name": "Collection", "techniques": ["T1005", "T1074"]},
+    "TA0010": {"name": "Exfiltration", "techniques": ["T1048"]},
+    "TA0011": {"name": "Command and Control", "techniques": ["T1071"]},
+    "TA0040": {"name": "Impact", "techniques": ["T1486", "T1490", "T1491"]},
+}
+
+# Technique name lookup
+TECHNIQUE_NAMES = {
+    "T1078": "Valid Accounts", "T1133": "External Remote Services",
+    "T1566": "Phishing", "T1204": "User Execution",
+    "T1059": "Command and Scripting Interpreter", "T1106": "Native API",
+    "T1053": "Scheduled Task/Job", "T1543": "Create or Modify System Process",
+    "T1546": "Event Triggered Execution", "T1547": "Boot or Logon Autostart Execution",
+    "T1574": "Hijack Execution Flow", "T1197": "BITS Jobs",
+    "T1068": "Exploitation for Privilege Escalation", "T1055": "Process Injection",
+    "T1027": "Obfuscated Files or Information", "T1070": "Indicator Removal",
+    "T1112": "Modify Registry", "T1497": "Virtualization/Sandbox Evasion",
+    "T1562": "Impair Defenses",
+    "T1003": "OS Credential Dumping", "T1110": "Brute Force",
+    "T1550": "Use Alternate Authentication Material",
+    "T1012": "Query Registry", "T1018": "Remote System Discovery",
+    "T1082": "System Information Discovery", "T1083": "File and Directory Discovery",
+    "T1021": "Remote Services", "T1570": "Lateral Tool Transfer",
+    "T1005": "Data from Local System", "T1074": "Data Staged",
+    "T1048": "Exfiltration Over Alternative Protocol",
+    "T1071": "Application Layer Protocol",
+    "T1486": "Data Encrypted for Impact", "T1490": "Inhibit System Recovery",
+    "T1491": "Defacement",
+    "T1098": "Account Manipulation", "T1136": "Create Account",
+}
+
+
+class MITREReportGenerator:
+    """Generate a dedicated MITRE ATT&CK mapped report."""
+
+    def __init__(self, findings: List[Finding], confidence_result: Optional[Dict],
+                 output_dir: str, logger: logging.Logger,
+                 os_info: Optional[Dict[str, str]] = None):
+        self.findings = findings
+        self.confidence_result = confidence_result or {}
+        self.output_dir = output_dir
+        self.logger = logger
+        self.os_info = os_info or get_os_info()
+
+        # Build technique → findings map
+        self.technique_findings: Dict[str, List[Finding]] = defaultdict(list)
+        for f in self.findings:
+            if f.mitre_id:
+                self.technique_findings[f.mitre_id].append(f)
+
+    def generate(self):
+        self._generate_mitre_json()
+        self._generate_mitre_txt()
+
+    def _build_tactic_data(self) -> List[Dict]:
+        """Build structured tactic/technique data for reports."""
+        tactics_data = []
+        for tactic_id, tactic_info in MITRE_TACTICS.items():
+            techniques = []
+            for tech_id in tactic_info["techniques"]:
+                findings_for_tech = self.technique_findings.get(tech_id, [])
+                if findings_for_tech:
+                    status = "CONFIRMED"
+                    max_sev = max(f.severity for f in findings_for_tech)
+                else:
+                    status = "NOT OBSERVED"
+                    max_sev = 0
+
+                techniques.append({
+                    "id": tech_id,
+                    "name": TECHNIQUE_NAMES.get(tech_id, MITRE_MAPPING.get(tech_id, "Unknown")),
+                    "status": status,
+                    "evidence_count": len(findings_for_tech),
+                    "max_severity": max_sev,
+                    "findings": [f.to_dict() for f in findings_for_tech],
+                })
+
+            observed = sum(1 for t in techniques if t["status"] == "CONFIRMED")
+            tactics_data.append({
+                "tactic_id": tactic_id,
+                "name": tactic_info["name"],
+                "techniques": techniques,
+                "techniques_observed": observed,
+                "techniques_total": len(techniques),
+            })
+        return tactics_data
+
+    def _generate_mitre_json(self):
+        """Generate machine-readable MITRE ATT&CK report."""
+        path = os.path.join(self.output_dir, "nova_mitre_report.json")
+        tactics_data = self._build_tactic_data()
+
+        total_techniques = sum(t["techniques_total"] for t in tactics_data)
+        observed_techniques = sum(t["techniques_observed"] for t in tactics_data)
+
+        data = {
+            "metadata": {
+                "tool": "Nova/RALord IR Toolkit - MITRE ATT&CK Report",
+                "version": "2.0",
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "hostname": self.os_info.get("hostname", socket.gethostname()),
+                "os_type": self.os_info.get("os_type", ""),
+                "os_distribution": self.os_info.get("distribution", ""),
+                "os_architecture": self.os_info.get("architecture", ""),
+                "os_platform": self.os_info.get("platform", platform.platform()),
+            },
+            "attribution": self.confidence_result,
+            "coverage_summary": {
+                "total_techniques_mapped": total_techniques,
+                "techniques_observed": observed_techniques,
+                "techniques_not_observed": total_techniques - observed_techniques,
+                "coverage_percentage": round((observed_techniques / total_techniques) * 100, 1) if total_techniques > 0 else 0,
+            },
+            "tactics": tactics_data,
+        }
+
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2, default=str)
+        self.logger.info(f"[MITRE] JSON MITRE report saved: {path}")
+
+    def _generate_mitre_txt(self):
+        """Generate human-readable MITRE ATT&CK report."""
+        path = os.path.join(self.output_dir, "nova_mitre_report.txt")
+        tactics_data = self._build_tactic_data()
+
+        total_techniques = sum(t["techniques_total"] for t in tactics_data)
+        observed_techniques = sum(t["techniques_observed"] for t in tactics_data)
+
+        with open(path, "w") as f:
+            f.write("=" * 80 + "\n")
+            f.write(" NOVA/RALord RANSOMWARE - MITRE ATT&CK ANALYSIS REPORT\n")
+            f.write(f" Generated: {datetime.now(timezone.utc).isoformat()}\n")
+            f.write(f" Host:      {self.os_info.get('hostname', socket.gethostname())}\n")
+            f.write(f" OS:        {self.os_info.get('distribution', platform.platform())}\n")
+            f.write(f" Arch:      {self.os_info.get('architecture', '')}\n")
+            if self.os_info.get("kernel"):
+                f.write(f" Kernel:    {self.os_info['kernel']}\n")
+            f.write("=" * 80 + "\n\n")
+
+            # Section 1: Nova Attribution Assessment
+            f.write("=" * 80 + "\n")
+            f.write(" 1. NOVA ATTRIBUTION ASSESSMENT\n")
+            f.write("=" * 80 + "\n\n")
+
+            cr = self.confidence_result
+            if cr:
+                f.write(f"  Confidence Level:  {cr.get('confidence_level', 'N/A')}\n")
+                f.write(f"  Attribution Score: {cr.get('score', 0)}/{cr.get('max_possible', 0)} "
+                        f"({cr.get('percentage', 0)}%)\n")
+                f.write(f"  Categories Matched: {cr.get('categories_matched', 0)}/{cr.get('categories_total', 0)}\n\n")
+
+                f.write("  Evidence Breakdown:\n")
+                f.write("  " + "-" * 60 + "\n")
+                for cat, info in cr.get("evidence_breakdown", {}).items():
+                    status = "[+]" if info.get("matched") else "[ ]"
+                    f.write(f"    {status} {cat:<30} (weight: {info.get('weight', 0):>3})")
+                    if info.get("matched"):
+                        f.write(f"  [{info.get('evidence_count', 0)} evidence item(s)]")
+                    f.write("\n")
+                f.write("\n")
+            else:
+                f.write("  Attribution scoring was not performed.\n\n")
+
+            # Section 2: Attack Chain Narrative
+            f.write("=" * 80 + "\n")
+            f.write(" 2. ATTACK CHAIN NARRATIVE\n")
+            f.write("=" * 80 + "\n\n")
+
+            narrative_tactics = [
+                ("TA0001", "INITIAL ACCESS", "The attacker gained entry to the environment"),
+                ("TA0002", "EXECUTION", "Malicious code was executed on compromised systems"),
+                ("TA0003", "PERSISTENCE", "Mechanisms were established to maintain access"),
+                ("TA0004", "PRIVILEGE ESCALATION", "Higher privileges were obtained"),
+                ("TA0005", "DEFENSE EVASION", "Security controls were disabled or bypassed"),
+                ("TA0006", "CREDENTIAL ACCESS", "Credentials were harvested for lateral movement"),
+                ("TA0007", "DISCOVERY", "The environment was enumerated and mapped"),
+                ("TA0008", "LATERAL MOVEMENT", "The attacker spread across the network"),
+                ("TA0009", "COLLECTION", "Data was gathered for exfiltration"),
+                ("TA0010", "EXFILTRATION", "Stolen data was sent to attacker infrastructure"),
+                ("TA0011", "COMMAND AND CONTROL", "C2 channels were established"),
+                ("TA0040", "IMPACT", "Ransomware was deployed and data encrypted"),
+            ]
+
+            for tactic_id, label, description in narrative_tactics:
+                tactic_data = next((t for t in tactics_data if t["tactic_id"] == tactic_id), None)
+                if tactic_data and tactic_data["techniques_observed"] > 0:
+                    observed = [t for t in tactic_data["techniques"] if t["status"] == "CONFIRMED"]
+                    tech_names = ", ".join(f'{t["id"]}' for t in observed)
+                    f.write(f"  >> {label}: {description}\n")
+                    f.write(f"     Observed techniques: {tech_names}\n")
+                    # Show top evidence
+                    for tech in observed:
+                        for finding in tech["findings"][:1]:
+                            f.write(f"     - {finding.get('title', '')}\n")
+                    f.write("\n")
+
+            # Section 3: MITRE ATT&CK Matrix
+            f.write("=" * 80 + "\n")
+            f.write(" 3. MITRE ATT&CK TECHNIQUE MATRIX\n")
+            f.write("=" * 80 + "\n\n")
+
+            for tactic in tactics_data:
+                f.write(f"  {tactic['tactic_id']} - {tactic['name']} "
+                        f"({tactic['techniques_observed']}/{tactic['techniques_total']} observed)\n")
+                f.write("  " + "-" * 70 + "\n")
+
+                for tech in tactic["techniques"]:
+                    status_tag = "CONFIRMED" if tech["status"] == "CONFIRMED" else "NOT OBSERVED"
+                    f.write(f"    [{status_tag:^14}] {tech['id']} - {tech['name']}")
+                    if tech["evidence_count"] > 0:
+                        f.write(f" ({tech['evidence_count']} finding(s))")
+                    f.write("\n")
+
+                    if tech["status"] == "CONFIRMED":
+                        for finding in tech["findings"][:3]:
+                            desc = finding.get("description", "")
+                            if len(desc) > 80:
+                                desc = desc[:77] + "..."
+                            f.write(f"      - Evidence: {desc}\n")
+
+                f.write("\n")
+
+            # Section 4: Coverage Summary
+            f.write("=" * 80 + "\n")
+            f.write(" 4. TECHNIQUE COVERAGE SUMMARY\n")
+            f.write("=" * 80 + "\n\n")
+
+            coverage_pct = round((observed_techniques / total_techniques) * 100, 1) if total_techniques > 0 else 0
+            f.write(f"  Total Techniques Mapped:    {total_techniques}\n")
+            f.write(f"  Techniques Observed:        {observed_techniques}\n")
+            f.write(f"  Techniques Not Observed:    {total_techniques - observed_techniques}\n")
+            f.write(f"  Coverage:                   {coverage_pct}%\n\n")
+
+            f.write("  Per-Tactic Summary:\n")
+            f.write(f"  {'Tactic':<8} {'Name':<28} {'Observed':>10} {'Total':>8} {'Coverage':>10}\n")
+            f.write("  " + "-" * 66 + "\n")
+            for tactic in tactics_data:
+                pct = round((tactic["techniques_observed"] / tactic["techniques_total"]) * 100) if tactic["techniques_total"] > 0 else 0
+                f.write(f"  {tactic['tactic_id']:<8} {tactic['name']:<28} "
+                        f"{tactic['techniques_observed']:>10} {tactic['techniques_total']:>8} "
+                        f"{pct:>9}%\n")
+            f.write("\n")
+
+            # Section 5: Recommendations Per Tactic
+            f.write("=" * 80 + "\n")
+            f.write(" 5. RECOMMENDATIONS PER TACTIC\n")
+            f.write("=" * 80 + "\n\n")
+
+            recommendations = {
+                "TA0001": [
+                    "Enforce MFA on all remote access (VPN, RDP, Citrix, cloud portals)",
+                    "Audit and restrict exposed services with network segmentation",
+                    "Monitor for credential stuffing and brute force attempts",
+                ],
+                "TA0002": [
+                    "Enable PowerShell Constrained Language Mode",
+                    "Deploy application whitelisting (AppLocker/WDAC)",
+                    "Enable command-line and script block logging",
+                ],
+                "TA0003": [
+                    "Audit scheduled tasks, services, and registry run keys regularly",
+                    "Monitor WMI event subscriptions and BITS jobs",
+                    "Implement change detection on critical system configs",
+                ],
+                "TA0004": [
+                    "Patch systems promptly, especially known privilege escalation CVEs",
+                    "Use Credential Guard to protect LSASS",
+                    "Restrict local admin rights using LAPS",
+                ],
+                "TA0005": [
+                    "Enable tamper protection on all EDR/AV agents",
+                    "Centralize log collection to prevent local log clearing",
+                    "Monitor for Defender exclusion changes and service stops",
+                ],
+                "TA0006": [
+                    "Enable Credential Guard and disable WDigest",
+                    "Monitor for LSASS access and credential dumping tools",
+                    "Implement tiered administration to limit credential exposure",
+                ],
+                "TA0007": [
+                    "Detect and alert on network scanning tools",
+                    "Limit unnecessary admin tool availability",
+                    "Segment networks to limit discovery scope",
+                ],
+                "TA0008": [
+                    "Restrict RDP access with jump servers and MFA",
+                    "Disable PsExec where not needed, monitor for PSEXESVC",
+                    "Enable Windows Firewall rules to restrict SMB laterally",
+                ],
+                "TA0009": [
+                    "Monitor for bulk file access and archive creation",
+                    "Detect large staging operations in temp directories",
+                ],
+                "TA0010": [
+                    "Block rclone and unauthorized cloud sync tools at proxy/firewall",
+                    "Monitor for large outbound transfers to cloud storage",
+                    "Implement DLP policies for sensitive data",
+                ],
+                "TA0011": [
+                    "Block known C2 IPs and domains at perimeter",
+                    "Monitor DNS for Tor/onion and suspicious domain queries",
+                    "Deploy SSL/TLS inspection for outbound encrypted traffic",
+                ],
+                "TA0040": [
+                    "Maintain offline, immutable backups tested regularly",
+                    "Enable Volume Shadow Copy protection and monitor deletions",
+                    "Have a tested IR playbook ready for ransomware incidents",
+                ],
+            }
+
+            for tactic in tactics_data:
+                tid = tactic["tactic_id"]
+                f.write(f"  {tid} - {tactic['name']}\n")
+                if tactic["techniques_observed"] > 0:
+                    f.write(f"    STATUS: ACTIVITY DETECTED ({tactic['techniques_observed']} technique(s))\n")
+                else:
+                    f.write(f"    STATUS: No activity observed\n")
+
+                for rec in recommendations.get(tid, []):
+                    f.write(f"    -> {rec}\n")
+                f.write("\n")
+
+        self.logger.info(f"[MITRE] Text MITRE report saved: {path}")
+
+
+# ============================================================================
 # MAIN ORCHESTRATOR
 # ============================================================================
 
@@ -2325,127 +4001,189 @@ def main():
     ║                                                                ║
     ║  Modules: IOC Scanner | Persistence | Lateral Movement         ║
     ║           Exfiltration | Defense Evasion | Credential Artifacts ║
-    ║           Live Triage | Timeline Builder                       ║
+    ║           Live Triage | EVTX Analyzer | Timeline Builder        ║
+    ║           Nova Confidence Scorer | MITRE ATT&CK Report          ║
     ║                                                                ║
     ║  ⚠  RUN AS ADMINISTRATOR / ROOT FOR FULL VISIBILITY  ⚠        ║
     ╚══════════════════════════════════════════════════════════════════╝
     """
     print(banner)
-    
+
     parser = argparse.ArgumentParser(description="Nova/RALord Ransomware IR Toolkit")
     parser.add_argument("--output-dir", "-o", default=None,
                         help="Output directory for reports")
     parser.add_argument("--modules", "-m", default="all",
-                        help="Comma-separated modules: ioc,persistence,lateral,exfil,evasion,creds,triage,timeline (or 'all')")
+                        help="Comma-separated modules: ioc,persistence,lateral,exfil,evasion,creds,triage,evtx (or 'all')")
     parser.add_argument("--quick", "-q", action="store_true",
                         help="Quick triage mode (IOC + Triage only)")
+    parser.add_argument("--evtx", nargs="+", default=None,
+                        help="Path(s) to .evtx file(s) or directory containing .evtx files for offline analysis")
     args = parser.parse_args()
-    
+
     # Setup output directory
     if args.output_dir:
         output_dir = args.output_dir
     else:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         output_dir = os.path.join(os.path.expanduser("~"), f"nova_ir_{ts}")
-    
+
     os.makedirs(output_dir, exist_ok=True)
     logger = setup_logging(output_dir)
-    
+
     # Initialize shared system data cache to avoid duplicate expensive commands
     global _system_cache
     _system_cache = SystemDataCache()
 
-    logger.info(f"Nova IR Toolkit started on {socket.gethostname()} ({platform.platform()})")
+    # ---- OS Detection ----
+    os_info = get_os_info()
+    os_type = os_info["os_type"]
+
+    print(f"  [*] Detected OS:     {os_info['distribution']}")
+    print(f"  [*] Architecture:    {os_info['architecture']}")
+    print(f"  [*] Hostname:        {os_info['hostname']}")
+    if os_info["kernel"]:
+        print(f"  [*] Kernel:          {os_info['kernel']}")
+    if os_info["version"]:
+        print(f"  [*] Version:         {os_info['version']}")
+    print()
+
+    logger.info(f"Nova IR Toolkit started on {os_info['hostname']}")
+    logger.info(f"Detected OS: {os_info['distribution']} ({os_info['architecture']})")
+    logger.info(f"Platform: {os_info['platform']}")
+    if os_info["kernel"]:
+        logger.info(f"Kernel: {os_info['kernel']}")
     logger.info(f"Output directory: {output_dir}")
-    
+
     # Determine modules to run
     if args.quick:
         modules = {"ioc", "triage"}
     elif args.modules == "all":
         modules = {"ioc", "persistence", "lateral", "exfil", "evasion", "creds", "triage"}
+        if args.evtx:
+            modules.add("evtx")
     else:
         modules = set(args.modules.lower().split(","))
-    
+
+    # Auto-enable evtx module if --evtx paths provided
+    if args.evtx:
+        modules.add("evtx")
+
+    # ---- Display module applicability for this OS ----
+    os_modules = OS_MODULE_MAP.get(os_type, {})
+    logger.info(f"Running on {os_type.upper()} — module coverage for this platform:")
+    for mod_name in sorted(modules):
+        coverage = os_modules.get(mod_name, "Unknown")
+        logger.info(f"  {mod_name:<14} -> {coverage}")
+
     all_findings: List[Finding] = []
-    
+
     # ---- Run modules ----
     if "ioc" in modules:
         logger.info("=" * 60)
-        logger.info("MODULE 1: IOC SCANNER")
+        logger.info(f"MODULE 1: IOC SCANNER [{os_type.upper()}]")
         logger.info("=" * 60)
         scanner = IOCScanner(logger)
         all_findings.extend(scanner.run_all())
-    
+
     if "persistence" in modules:
         logger.info("=" * 60)
-        logger.info("MODULE 2: PERSISTENCE HUNTER")
+        logger.info(f"MODULE 2: PERSISTENCE HUNTER [{os_type.upper()}]")
         logger.info("=" * 60)
         persist = PersistenceHunter(logger)
         all_findings.extend(persist.run_all())
-    
+
     if "lateral" in modules:
         logger.info("=" * 60)
-        logger.info("MODULE 3: LATERAL MOVEMENT DETECTOR")
+        logger.info(f"MODULE 3: LATERAL MOVEMENT DETECTOR [{os_type.upper()}]")
         logger.info("=" * 60)
         lateral = LateralMovementDetector(logger)
         all_findings.extend(lateral.run_all())
-    
+
     if "exfil" in modules:
         logger.info("=" * 60)
-        logger.info("MODULE 4: EXFILTRATION DETECTOR")
+        logger.info(f"MODULE 4: EXFILTRATION DETECTOR [{os_type.upper()}]")
         logger.info("=" * 60)
         exfil = ExfiltrationDetector(logger)
         all_findings.extend(exfil.run_all())
-    
+
     if "evasion" in modules:
         logger.info("=" * 60)
-        logger.info("MODULE 5: DEFENSE EVASION DETECTOR")
+        logger.info(f"MODULE 5: DEFENSE EVASION DETECTOR [{os_type.upper()}]")
         logger.info("=" * 60)
         evasion = DefenseEvasionDetector(logger)
         all_findings.extend(evasion.run_all())
-    
+
     if "creds" in modules:
         logger.info("=" * 60)
-        logger.info("MODULE 5b: CREDENTIAL & ARTIFACT HUNTER")
+        logger.info(f"MODULE 5b: CREDENTIAL & ARTIFACT HUNTER [{os_type.upper()}]")
         logger.info("=" * 60)
         creds = CredentialArtifactHunter(logger)
         all_findings.extend(creds.run_all())
 
     if "triage" in modules:
         logger.info("=" * 60)
-        logger.info("MODULE 6: LIVE TRIAGE")
+        logger.info(f"MODULE 6: LIVE TRIAGE [{os_type.upper()}]")
         logger.info("=" * 60)
         triage = LiveTriage(logger)
         all_findings.extend(triage.run_all())
-    
+
+    if "evtx" in modules:
+        logger.info("=" * 60)
+        logger.info("MODULE 8: EVTX ANALYZER (Offline Event Logs)")
+        logger.info("=" * 60)
+        if args.evtx:
+            evtx_analyzer = EVTXAnalyzer(args.evtx, logger)
+            all_findings.extend(evtx_analyzer.run_all())
+        else:
+            logger.warning("[EVTX] Module enabled but no --evtx paths provided. Skipping.")
+
+    # ---- Nova Confidence Scoring ----
+    logger.info("=" * 60)
+    logger.info("NOVA ATTRIBUTION / CONFIDENCE SCORING")
+    logger.info("=" * 60)
+    scorer = NovaConfidenceScorer()
+    confidence_result = scorer.score(all_findings)
+    attribution_finding = scorer.generate_attribution_finding()
+    all_findings.append(attribution_finding)
+    logger.info(f"[ATTRIBUTION] {confidence_result['confidence_level']} "
+                f"(Score: {confidence_result['score']}/{confidence_result['max_possible']})")
+
     # ---- Timeline ----
     logger.info("=" * 60)
-    logger.info("MODULE 7: TIMELINE BUILDER")
+    logger.info("TIMELINE BUILDER")
     logger.info("=" * 60)
     tb = TimelineBuilder(all_findings, logger)
     timeline = tb.build()
-    
+
     # ---- Reports ----
     logger.info("=" * 60)
     logger.info("GENERATING REPORTS")
     logger.info("=" * 60)
-    reporter = ReportGenerator(all_findings, timeline, output_dir, logger)
+    reporter = ReportGenerator(all_findings, timeline, output_dir, logger, os_info=os_info)
     reporter.generate_all()
-    
+
+    # ---- MITRE ATT&CK Report ----
+    logger.info("=" * 60)
+    logger.info("GENERATING MITRE ATT&CK REPORT")
+    logger.info("=" * 60)
+    mitre_reporter = MITREReportGenerator(all_findings, confidence_result, output_dir, logger, os_info=os_info)
+    mitre_reporter.generate()
+
     # ---- Summary ----
     critical = sum(1 for f in all_findings if f.severity == 5)
     high = sum(1 for f in all_findings if f.severity == 4)
-    
+
     print("\n" + "=" * 60)
     print(f"  SCAN COMPLETE - {len(all_findings)} findings")
     print(f"  CRITICAL: {critical} | HIGH: {high}")
+    print(f"  NOVA ATTRIBUTION: {confidence_result['confidence_level']}")
     print(f"  Reports saved to: {output_dir}")
     print("=" * 60)
-    
+
     if critical > 0:
         print("\n  ⚠️  CRITICAL FINDINGS DETECTED - IMMEDIATE ACTION REQUIRED")
         print("  ⚠️  Isolate this host and escalate to your IR team NOW\n")
-    
+
     return 0 if critical == 0 else 1
 
 
