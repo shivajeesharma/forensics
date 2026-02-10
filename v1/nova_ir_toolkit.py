@@ -4,7 +4,7 @@
  NOVA (formerly RALord) RANSOMWARE - INCIDENT RESPONSE & THREAT HUNTING TOOLKIT
 ================================================================================
  Author:  SOC/IR Team
- Version: 2.0
+ Version: 2.1
  Date:    2026-02-09
  
  PURPOSE:
@@ -21,24 +21,33 @@
    - MITRE:     T1574, T1562, T1083, T1486, T1490, T1059, T1021, T1078, T1048
 
  MODULES:
-   1. IOC Scanner         - Known hashes, file extensions, ransom notes, network IOCs
-   2. Persistence Hunter  - Registry, services, scheduled tasks, cron, launch agents
-   3. Lateral Movement    - RDP, SMB, WMI, PsExec, SSH traces
-   4. Exfiltration Detect - Large outbound transfers, cloud upload tools, staging dirs
-   5. Defense Evasion     - Disabled AV/EDR, tampered logs, shadow copy deletion
-   6. Live Triage         - Current connections, processes, users, open files
-   7. Timeline Builder    - Consolidates all findings into a chronological timeline
-   8. EVTX Analyzer       - Offline .evtx event log parsing (Security, System, Sysmon, PS, RDP)
-   *  Nova Confidence Scorer - Weighted attribution scoring for definitive Nova identification
-   *  MITRE ATT&CK Report   - Tactic-by-tactic MITRE mapped report (JSON + TXT)
+   1.  IOC Scanner          - Known hashes, file extensions, ransom notes, network IOCs
+   2.  Persistence Hunter   - Registry, services, tasks, cron, IFEO, COM, AppInit, LSA, LD_PRELOAD
+   3.  Lateral Movement     - RDP, SMB, WMI, PsExec, SSH traces
+   4.  Exfiltration Detect  - Large outbound transfers, cloud upload tools, staging dirs
+   5a. Defense Evasion      - Disabled AV/EDR, tampered logs, shadow copies, firewall, NTFS ADS, XProtect, TCC
+   5b. Credential Artifacts - LSASS dumps, hive copies, PowerShell history, user accounts
+   5c. Rootkit Detector     - Unsigned drivers, hidden processes, kernel module tampering
+   5d. Web Shell Detector   - Web shell pattern detection in web server directories
+   5e. Certificate Auditor  - Trust store audit for rogue/recently added CA certificates
+   6.  Live Triage          - Current connections, processes, users, open files
+   7.  Timeline Builder     - Consolidates all findings into a chronological timeline
+   8.  EVTX Analyzer        - Offline .evtx event log parsing (Security, System, Sysmon, PS, RDP)
+   *   Nova Confidence Scorer - Weighted attribution scoring for definitive Nova identification
+   *   MITRE ATT&CK Report   - Tactic-by-tactic MITRE mapped report (JSON + TXT)
+
+ MODES:
+   LIVE    - Full system analysis with all modules (default)
+   OFFLINE - EVTX-only analysis, no live system checks (auto when --evtx without --modules)
 
  USAGE:
    Run as Administrator/root:
-     python3 nova_ir_toolkit.py [--output-dir /path/to/output] [--modules all]
-     python3 nova_ir_toolkit.py --modules ioc,persistence,timeline
-     python3 nova_ir_toolkit.py --quick   (fast triage only)
-     python3 nova_ir_toolkit.py --evtx /path/to/logs/  (offline EVTX analysis)
-     python3 nova_ir_toolkit.py --modules evtx --evtx /path/to/Security.evtx
+     python3 nova_ir_toolkit.py                                  (LIVE: all modules)
+     python3 nova_ir_toolkit.py --modules all --evtx /path/      (LIVE + EVTX)
+     python3 nova_ir_toolkit.py --evtx /path/to/logs/            (OFFLINE: auto-detected)
+     python3 nova_ir_toolkit.py --offline --evtx /path/to/logs/  (OFFLINE: explicit)
+     python3 nova_ir_toolkit.py --modules ioc,persistence,rootkit,certs
+     python3 nova_ir_toolkit.py --quick                          (IOC + Triage only)
 
  NOTES:
    - Does NOT modify the system (read-only forensics)
@@ -203,6 +212,16 @@ MITRE_MAPPING = {
     "T1543": "Create or Modify System Process - Persistence via services",
     "T1110": "Brute Force - Repeated failed logon attempts",
     "T1098": "Account Manipulation - Modifying account permissions/group membership",
+    "T1014": "Rootkit - Hiding processes, files, or drivers from OS view",
+    "T1505.003": "Web Shell - Persistent backdoor in web-accessible directory",
+    "T1553": "Subvert Trust Controls - Certificate/trust store tampering",
+    "T1564": "Hide Artifacts - NTFS Alternate Data Streams or hidden files",
+    "T1546.008": "Accessibility Features - sethc/utilman/osk/narrator hijacking",
+    "T1546.012": "Image File Execution Options Injection - IFEO debugger hijacking",
+    "T1546.015": "Component Object Model Hijacking - COM object persistence",
+    "T1547.010": "Port Monitors - Print monitor DLL persistence",
+    "T1547.002": "Authentication Package - LSA authentication/notification package persistence",
+    "T1574.001": "DLL Search Order Hijacking - AppInit_DLLs / DLL preloading",
 }
 
 
@@ -332,33 +351,42 @@ def get_os_info() -> Dict[str, str]:
 OS_MODULE_MAP = {
     "windows": {
         "ioc": "Full (file scan, hash check, tools, ransom notes)",
-        "persistence": "Full (registry, services, scheduled tasks, WMI, BITS)",
+        "persistence": "Full (registry, services, scheduled tasks, WMI, BITS, IFEO, COM, AppInit, Print Monitors, LSA, Accessibility)",
         "lateral": "Full (RDP, SMB, WMI, PsExec, logon events)",
         "exfil": "Full (rclone config, staging dirs, outbound connections)",
-        "evasion": "Full (Defender, shadow copies, event logs, tamper protection)",
+        "evasion": "Full (Defender, shadow copies, event logs, tamper protection, firewall audit, NTFS ADS)",
         "creds": "Full (LSASS dumps, hive copies, PowerShell history, user accounts)",
         "triage": "Full (processes, connections, DNS cache, listeners)",
         "evtx": "Full (offline .evtx event log parsing)",
+        "rootkit": "Full (unsigned drivers, test signing, known rootkit driver names)",
+        "webshell": "Full (IIS/XAMPP web root scanning)",
+        "certs": "Full (root certificate store audit)",
     },
     "linux": {
         "ioc": "Full (file scan, hash check, tools, ransom notes)",
-        "persistence": "Full (cron, systemd, authorized_keys, rc.local, profiles)",
+        "persistence": "Full (cron, systemd, authorized_keys, rc.local, profiles, LD_PRELOAD, kernel modules)",
         "lateral": "Full (SSH history, auth.log, failed logins)",
         "exfil": "Full (rclone config, staging dirs, outbound connections)",
         "evasion": "Full (security services, log integrity, iptables, bash history)",
         "creds": "Full (/proc analysis, shadow copies, user accounts, network recon)",
         "triage": "Full (processes, connections, listeners)",
         "evtx": "Offline only (parses Windows .evtx files collected from other hosts)",
+        "rootkit": "Full (hidden processes, deleted binaries, kernel module discrepancies)",
+        "webshell": "Full (Apache/Nginx web root scanning)",
+        "certs": "Full (CA certificate store freshness audit)",
     },
     "macos": {
         "ioc": "Full (file scan, hash check, tools, ransom notes)",
         "persistence": "Full (LaunchAgents, LaunchDaemons, login items)",
         "lateral": "Partial (login history, Screen Sharing/ARD)",
         "exfil": "Full (rclone config, staging dirs, outbound connections)",
-        "evasion": "Partial (Gatekeeper, SIP status)",
+        "evasion": "Full (Gatekeeper, SIP, XProtect freshness, TCC permissions)",
         "creds": "Partial (user accounts, network recon)",
         "triage": "Full (processes, connections, listeners)",
         "evtx": "Offline only (parses Windows .evtx files collected from other hosts)",
+        "rootkit": "Full (non-Apple kexts, system extensions, binary code signing)",
+        "webshell": "Full (macOS web server root scanning)",
+        "certs": "Full (System keychain certificate audit)",
     },
 }
 
@@ -968,7 +996,195 @@ class PersistenceHunter:
                     severity=4, mitre_id="T1543",
                     evidence={"services": suspicious_svcs},
                 ))
-        
+
+        # --- IFEO Debugger Hijacking ---
+        self.logger.info("  SEARCHING: Image File Execution Options debugger hijacks")
+        out, _, rc = run_cmd(
+            r'reg query "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options" /s /v Debugger 2>nul'
+        )
+        if rc == 0 and out:
+            ifeo_entries = []
+            current_key = ""
+            for line in out.split("\n"):
+                line = line.strip()
+                if line.startswith("HKEY_"):
+                    current_key = line
+                elif "Debugger" in line and "REG_SZ" in line:
+                    debugger_val = line.split("REG_SZ")[-1].strip().lower()
+                    known_safe = ["ntsd.exe", "vsjitdebugger.exe", "windbg.exe", "devenv.exe"]
+                    if debugger_val and not any(safe in debugger_val for safe in known_safe):
+                        ifeo_entries.append({
+                            "registry_key": current_key,
+                            "debugger_value": line.split("REG_SZ")[-1].strip(),
+                        })
+            if ifeo_entries:
+                self.findings.append(Finding(
+                    self.MODULE,
+                    "IFEO DEBUGGER HIJACKING DETECTED",
+                    f"Found {len(ifeo_entries)} suspicious IFEO debugger entries - attackers redirect legitimate binaries to malicious payloads",
+                    severity=5, mitre_id="T1546.012",
+                    evidence={"ifeo_entries": ifeo_entries},
+                ))
+
+        # --- COM Object Hijacking ---
+        self.logger.info("  SEARCHING: COM object hijacking in HKCU\\CLSID")
+        out, _, rc = run_cmd(
+            r'reg query "HKCU\SOFTWARE\Classes\CLSID" /s 2>nul', timeout=30
+        )
+        if rc == 0 and out:
+            suspicious_com = []
+            current_clsid = ""
+            for line in out.split("\n"):
+                line = line.strip()
+                if "HKEY_CURRENT_USER" in line and "CLSID" in line:
+                    current_clsid = line
+                elif ("InprocServer32" in line or "LocalServer32" in line) and "REG_" in line:
+                    val = line.split("REG_SZ")[-1].strip().lower() if "REG_SZ" in line else line.split("REG_EXPAND_SZ")[-1].strip().lower()
+                    suspect_paths = ["\\temp\\", "\\tmp\\", "\\appdata\\local\\temp", "\\downloads\\",
+                                     "\\programdata\\", "\\users\\public\\", "\\perflogs\\"]
+                    if any(sp in val for sp in suspect_paths):
+                        suspicious_com.append({
+                            "clsid_key": current_clsid,
+                            "server_path": line.strip(),
+                        })
+            if suspicious_com:
+                self.findings.append(Finding(
+                    self.MODULE,
+                    "COM OBJECT HIJACKING DETECTED",
+                    f"Found {len(suspicious_com)} HKCU COM objects pointing to suspicious paths",
+                    severity=4, mitre_id="T1546.015",
+                    evidence={"com_entries": suspicious_com},
+                ))
+
+        # --- AppInit_DLLs ---
+        self.logger.info("  SEARCHING: AppInit_DLLs DLL injection")
+        out, _, rc = run_cmd(
+            r'reg query "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows" /v AppInit_DLLs 2>nul'
+        )
+        if rc == 0 and out:
+            for line in out.split("\n"):
+                if "AppInit_DLLs" in line and "REG_SZ" in line:
+                    dll_val = line.split("REG_SZ")[-1].strip()
+                    if dll_val:
+                        # Check if LoadAppInit_DLLs is enabled
+                        out2, _, rc2 = run_cmd(
+                            r'reg query "HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows" /v LoadAppInit_DLLs 2>nul'
+                        )
+                        load_enabled = "0x1" in out2 if rc2 == 0 else False
+                        self.findings.append(Finding(
+                            self.MODULE,
+                            "APPINIT_DLLS INJECTION CONFIGURED",
+                            f"AppInit_DLLs set to '{dll_val}' (LoadAppInit_DLLs enabled: {load_enabled}) - used for process-wide DLL injection",
+                            severity=5 if load_enabled else 3, mitre_id="T1574.001",
+                            evidence={"appinit_dlls": dll_val, "load_enabled": load_enabled},
+                        ))
+
+        # --- Print Monitor DLLs ---
+        self.logger.info("  SEARCHING: Print Monitor DLL persistence")
+        out, _, rc = run_cmd(
+            r'reg query "HKLM\SYSTEM\CurrentControlSet\Control\Print\Monitors" /s 2>nul'
+        )
+        if rc == 0 and out:
+            known_monitors = ["localspl.dll", "tcpmon.dll", "usbmon.dll", "wsdmon.dll",
+                              "apmon.dll", "lprmon.dll", "localui.dll", "tcpmonui.dll",
+                              "wsdmonui.dll", "apmui.dll"]
+            suspicious_monitors = []
+            current_monitor = ""
+            for line in out.split("\n"):
+                line = line.strip()
+                if line.startswith("HKEY_"):
+                    current_monitor = line.split("\\")[-1] if "\\" in line else line
+                elif "Driver" in line and "REG_SZ" in line:
+                    driver_dll = line.split("REG_SZ")[-1].strip().lower()
+                    if driver_dll and driver_dll not in known_monitors:
+                        suspicious_monitors.append({
+                            "monitor_name": current_monitor,
+                            "driver_dll": line.split("REG_SZ")[-1].strip(),
+                        })
+            if suspicious_monitors:
+                self.findings.append(Finding(
+                    self.MODULE,
+                    "SUSPICIOUS PRINT MONITOR DLL",
+                    f"Found {len(suspicious_monitors)} non-standard print monitor DLLs - can be used for SYSTEM-level persistence",
+                    severity=4, mitre_id="T1547.010",
+                    evidence={"monitors": suspicious_monitors},
+                ))
+
+        # --- LSA Authentication/Security/Notification Packages ---
+        self.logger.info("  SEARCHING: LSA authentication/notification packages")
+        known_lsa_defaults = {
+            "authentication packages": ["msv1_0", ""],
+            "notification packages": ["scecli", ""],
+            "security packages": ["kerberos", "msv1_0", "schannel", "wdigest", "tspkg", "pku2u", "cloudap", ""],
+        }
+        lsa_suspicious = []
+        for value_name, defaults in known_lsa_defaults.items():
+            out, _, rc = run_cmd(
+                f'reg query "HKLM\\SYSTEM\\CurrentControlSet\\Control\\Lsa" /v "{value_name}" 2>nul'
+            )
+            if rc == 0 and out:
+                for line in out.split("\n"):
+                    if value_name.lower() in line.lower() and "REG_MULTI_SZ" in line:
+                        packages_raw = line.split("REG_MULTI_SZ")[-1].strip()
+                        packages = [p.strip().lower() for p in packages_raw.split("\\0") if p.strip()]
+                        non_default = [p for p in packages if p not in defaults]
+                        if non_default:
+                            lsa_suspicious.append({
+                                "package_type": value_name,
+                                "non_default_entries": non_default,
+                                "all_entries": packages,
+                            })
+        if lsa_suspicious:
+            self.findings.append(Finding(
+                self.MODULE,
+                "NON-DEFAULT LSA PACKAGES DETECTED",
+                f"Found {len(lsa_suspicious)} LSA package categories with non-default entries - may indicate credential interception",
+                severity=4, mitre_id="T1547.002",
+                evidence={"lsa_packages": lsa_suspicious},
+            ))
+
+        # --- Accessibility Feature Backdoors ---
+        self.logger.info("  SEARCHING: Accessibility feature backdoors (sethc, utilman, osk, narrator, magnify)")
+        accessibility_binaries = [
+            "sethc.exe", "utilman.exe", "osk.exe", "narrator.exe",
+            "magnify.exe", "DisplaySwitch.exe", "AtBroker.exe",
+        ]
+        accessibility_findings = []
+        for binary in accessibility_binaries:
+            # Check IFEO debugger for this binary
+            out, _, rc = run_cmd(
+                f'reg query "HKLM\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\{binary}" /v Debugger 2>nul'
+            )
+            if rc == 0 and "Debugger" in out and "REG_SZ" in out:
+                debugger_val = out.split("REG_SZ")[-1].strip()
+                if debugger_val:
+                    accessibility_findings.append({
+                        "binary": binary,
+                        "attack_type": "IFEO_debugger",
+                        "debugger_value": debugger_val,
+                    })
+            # Check if binary has been replaced (wrong file size or signature)
+            sys_path = f"C:\\Windows\\System32\\{binary}"
+            out2, _, rc2 = run_cmd(
+                f'powershell -Command "(Get-AuthenticodeSignature \'{sys_path}\').Status" 2>nul',
+                timeout=10
+            )
+            if rc2 == 0 and out2.strip().lower() not in ["valid", "notsigned", ""]:
+                accessibility_findings.append({
+                    "binary": binary,
+                    "attack_type": "invalid_signature",
+                    "signature_status": out2.strip(),
+                    "path": sys_path,
+                })
+        if accessibility_findings:
+            self.findings.append(Finding(
+                self.MODULE,
+                "ACCESSIBILITY FEATURE BACKDOOR DETECTED",
+                f"Found {len(accessibility_findings)} accessibility binaries with IFEO hijacks or invalid signatures - classic persistence/privilege escalation",
+                severity=5, mitre_id="T1546.008",
+                evidence={"accessibility_backdoors": accessibility_findings},
+            ))
+
         return self.findings
     
     def check_linux_persistence(self) -> List[Finding]:
@@ -1076,7 +1292,105 @@ class PersistenceHunter:
                             })
                     except OSError:
                         pass
-        
+
+        # --- LD_PRELOAD Hijacking ---
+        self.logger.info("  SEARCHING: LD_PRELOAD hijacking (ld.so.preload, env vars, ld.so.conf)")
+        ld_preload_findings = []
+        if os.path.exists("/etc/ld.so.preload"):
+            try:
+                with open("/etc/ld.so.preload", "r") as f:
+                    content = f.read().strip()
+                    if content:
+                        ld_preload_findings.append({
+                            "type": "ld.so.preload",
+                            "path": "/etc/ld.so.preload",
+                            "libraries": [l.strip() for l in content.split("\n") if l.strip()],
+                        })
+            except (PermissionError, OSError):
+                pass
+        # Check LD_PRELOAD env in /proc
+        for pid_dir in glob.glob("/proc/[0-9]*/environ"):
+            try:
+                with open(pid_dir, "r", errors="ignore") as f:
+                    env_data = f.read()
+                    if "LD_PRELOAD=" in env_data:
+                        pid = pid_dir.split("/")[2]
+                        for entry in env_data.split("\x00"):
+                            if entry.startswith("LD_PRELOAD="):
+                                ld_preload_findings.append({
+                                    "type": "process_env",
+                                    "pid": pid,
+                                    "ld_preload": entry,
+                                })
+                                break
+            except (PermissionError, OSError):
+                pass
+        # Check ld.so.conf for entries pointing to suspicious dirs
+        ld_conf_files = ["/etc/ld.so.conf"]
+        ld_conf_files += glob.glob("/etc/ld.so.conf.d/*.conf")
+        for conf_file in ld_conf_files:
+            try:
+                with open(conf_file, "r") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith("#"):
+                            suspect_dirs = ["/tmp", "/dev/shm", "/var/tmp", "/run/shm"]
+                            if any(line.startswith(sd) for sd in suspect_dirs):
+                                ld_preload_findings.append({
+                                    "type": "ld.so.conf_suspicious",
+                                    "config_file": conf_file,
+                                    "entry": line,
+                                })
+            except (PermissionError, OSError):
+                pass
+        if ld_preload_findings:
+            self.findings.append(Finding(
+                self.MODULE,
+                "LD_PRELOAD HIJACKING DETECTED",
+                f"Found {len(ld_preload_findings)} LD_PRELOAD-related persistence indicators - used to intercept library calls",
+                severity=5, mitre_id="T1574.001",
+                evidence={"ld_preload_items": ld_preload_findings},
+            ))
+
+        # --- Hidden Kernel Modules ---
+        self.logger.info("  SEARCHING: Hidden kernel modules (lsmod vs /proc/modules comparison)")
+        try:
+            lsmod_out, _, rc1 = run_cmd("lsmod 2>/dev/null")
+            proc_out = ""
+            if os.path.exists("/proc/modules"):
+                with open("/proc/modules", "r") as f:
+                    proc_out = f.read()
+            if rc1 == 0 and lsmod_out and proc_out:
+                lsmod_modules = set()
+                for line in lsmod_out.split("\n")[1:]:  # skip header
+                    parts = line.split()
+                    if parts:
+                        lsmod_modules.add(parts[0])
+                proc_modules = set()
+                for line in proc_out.split("\n"):
+                    parts = line.split()
+                    if parts:
+                        proc_modules.add(parts[0])
+                # Modules in /proc but NOT in lsmod = potentially hidden
+                hidden = proc_modules - lsmod_modules
+                # Modules in lsmod but NOT in /proc = potentially tampered lsmod
+                ghost = lsmod_modules - proc_modules
+                discrepancies = []
+                for m in hidden:
+                    discrepancies.append({"module": m, "issue": "in /proc/modules but NOT in lsmod (potentially hidden)"})
+                for m in ghost:
+                    discrepancies.append({"module": m, "issue": "in lsmod but NOT in /proc/modules (lsmod may be tampered)"})
+                if discrepancies:
+                    self.findings.append(Finding(
+                        self.MODULE,
+                        "KERNEL MODULE DISCREPANCIES DETECTED",
+                        f"Found {len(discrepancies)} discrepancies between lsmod and /proc/modules - may indicate rootkit",
+                        severity=5, mitre_id="T1014",
+                        evidence={"discrepancies": discrepancies},
+                    ))
+        except (PermissionError, OSError):
+            pass
+
         if suspicious:
             self.findings.append(Finding(
                 self.MODULE,
@@ -1850,9 +2164,97 @@ class DefenseEvasionDetector:
                 severity=5, mitre_id="T1562",
                 evidence={"registry_value": out.strip()},
             ))
-        
+
+        # --- Windows Firewall Audit ---
+        self.logger.info("  SEARCHING: Suspicious Windows Firewall inbound allow rules")
+        out, _, rc = run_cmd(
+            'powershell -Command "Get-NetFirewallRule -Direction Inbound -Action Allow -Enabled True '
+            '| Select-Object DisplayName,DisplayGroup,@{N=\'Program\';E={(Get-NetFirewallApplicationFilter -AssociatedNetFirewallRule $_).Program}} '
+            '| ConvertTo-Json -Depth 3" 2>nul',
+            timeout=30
+        )
+        if rc == 0 and out:
+            try:
+                rules = json.loads(out)
+                if isinstance(rules, dict):
+                    rules = [rules]
+                suspicious_rules = []
+                suspect_programs = ["\\temp\\", "\\tmp\\", "\\appdata\\", "\\downloads\\",
+                                    "ngrok", "chisel", "ligolo", "frp", "socat",
+                                    "\\programdata\\", "\\perflogs\\", "\\users\\public\\"]
+                for rule in rules:
+                    program = str(rule.get("Program", "")).lower()
+                    group = rule.get("DisplayGroup") or ""
+                    if program and program != "any":
+                        # Flag rules with no group and suspicious program paths
+                        if not group and any(sp in program for sp in suspect_programs):
+                            suspicious_rules.append({
+                                "rule_name": rule.get("DisplayName", ""),
+                                "program": rule.get("Program", ""),
+                                "group": group,
+                            })
+                        # Also flag known tunnel/proxy tools regardless of group
+                        elif any(tool in program for tool in ["ngrok", "chisel", "ligolo", "frp", "socat"]):
+                            suspicious_rules.append({
+                                "rule_name": rule.get("DisplayName", ""),
+                                "program": rule.get("Program", ""),
+                                "group": group,
+                            })
+                if suspicious_rules:
+                    self.findings.append(Finding(
+                        self.MODULE,
+                        "SUSPICIOUS FIREWALL INBOUND RULES",
+                        f"Found {len(suspicious_rules)} suspicious inbound allow rules - may indicate attacker-created network access",
+                        severity=4, mitre_id="T1562",
+                        evidence={"suspicious_rules": suspicious_rules[:30]},
+                    ))
+            except json.JSONDecodeError:
+                pass
+
+        # --- NTFS Alternate Data Streams ---
+        self.logger.info("  SEARCHING: NTFS Alternate Data Streams in common staging directories")
+        ads_dirs = [
+            os.environ.get("TEMP", "C:\\Windows\\Temp"),
+            "C:\\ProgramData", "C:\\PerfLogs",
+            os.path.join(os.environ.get("USERPROFILE", "C:\\Users\\Default"), "Downloads"),
+        ]
+        suspicious_ads = []
+        for ads_dir in ads_dirs:
+            if not os.path.exists(ads_dir):
+                continue
+            out, _, rc = run_cmd(
+                f'powershell -Command "Get-ChildItem -Path \'{ads_dir}\' -Recurse -ErrorAction SilentlyContinue '
+                f'| ForEach-Object {{ $streams = Get-Item $_.FullName -Stream * -ErrorAction SilentlyContinue; '
+                f'$streams | Where-Object {{ $_.Stream -ne \':$DATA\' -and $_.Stream -ne \'Zone.Identifier\' }} '
+                f'| Select-Object @{{N=\'FilePath\';E={{$_.FileName}}}},Stream,Length }} '
+                f'| ConvertTo-Json -Depth 2" 2>nul',
+                timeout=20
+            )
+            if rc == 0 and out and out.strip() not in ["", "null"]:
+                try:
+                    streams = json.loads(out)
+                    if isinstance(streams, dict):
+                        streams = [streams]
+                    for s in streams:
+                        if s.get("Stream") and s.get("Length", 0) > 0:
+                            suspicious_ads.append({
+                                "file_path": s.get("FilePath", ""),
+                                "stream_name": s.get("Stream", ""),
+                                "size_bytes": s.get("Length", 0),
+                            })
+                except json.JSONDecodeError:
+                    pass
+        if suspicious_ads:
+            self.findings.append(Finding(
+                self.MODULE,
+                "NTFS ALTERNATE DATA STREAMS DETECTED",
+                f"Found {len(suspicious_ads)} non-standard ADS entries - data can be hidden in alternate streams",
+                severity=4, mitre_id="T1564",
+                evidence={"alternate_data_streams": suspicious_ads[:50]},
+            ))
+
         return self.findings
-    
+
     def check_linux_defense_evasion(self) -> List[Finding]:
         self.logger.info("[EVASION] Checking Linux defense evasion indicators...")
         self.logger.info("  SEARCHING: Security service status (auditd, rsyslog, fail2ban, EDR agents),")
@@ -1988,9 +2390,74 @@ class DefenseEvasionDetector:
                 severity=5, mitre_id="T1562",
                 evidence={"sip_status": out},
             ))
-        
+
+        # --- XProtect Definitions Freshness ---
+        self.logger.info("  SEARCHING: XProtect definition freshness")
+        xprotect_plist = "/Library/Apple/System/Library/CoreServices/XProtect.bundle/Contents/version.plist"
+        if not os.path.exists(xprotect_plist):
+            xprotect_plist = "/System/Library/CoreServices/XProtect.bundle/Contents/version.plist"
+        if os.path.exists(xprotect_plist):
+            try:
+                mtime = os.path.getmtime(xprotect_plist)
+                age_days = (datetime.now(timezone.utc).timestamp() - mtime) / 86400
+                if age_days > 30:
+                    self.findings.append(Finding(
+                        self.MODULE,
+                        "XPROTECT DEFINITIONS STALE",
+                        f"XProtect definitions are {int(age_days)} days old - should update within 30 days",
+                        severity=3, mitre_id="T1562",
+                        evidence={"xprotect_plist": xprotect_plist, "age_days": round(age_days, 1)},
+                    ))
+            except OSError:
+                pass
+        else:
+            self.findings.append(Finding(
+                self.MODULE,
+                "XPROTECT DEFINITIONS MISSING",
+                "XProtect version.plist not found - macOS malware protection may be compromised",
+                severity=4, mitre_id="T1562",
+                evidence={"checked_paths": [
+                    "/Library/Apple/System/Library/CoreServices/XProtect.bundle/Contents/version.plist",
+                    "/System/Library/CoreServices/XProtect.bundle/Contents/version.plist",
+                ]},
+            ))
+
+        # --- TCC Permissions Audit ---
+        self.logger.info("  SEARCHING: TCC database for suspicious Full Disk Access / Accessibility permissions")
+        tcc_dbs = [
+            "/Library/Application Support/com.apple.TCC/TCC.db",
+            os.path.expanduser("~/Library/Application Support/com.apple.TCC/TCC.db"),
+        ]
+        suspicious_tcc = []
+        for tcc_db in tcc_dbs:
+            if not os.path.exists(tcc_db):
+                continue
+            for service in ["kTCCServiceAccessibility", "kTCCServiceSystemPolicyAllFiles"]:
+                out, _, rc = run_cmd(
+                    f'sqlite3 "{tcc_db}" "SELECT client,auth_value FROM access WHERE service=\'{service}\' AND auth_value=2;" 2>/dev/null'
+                )
+                if rc == 0 and out:
+                    for line in out.split("\n"):
+                        if line.strip():
+                            parts = line.split("|")
+                            client = parts[0] if parts else line
+                            if not client.startswith("com.apple."):
+                                suspicious_tcc.append({
+                                    "database": tcc_db,
+                                    "service": service.replace("kTCCService", ""),
+                                    "client": client,
+                                })
+        if suspicious_tcc:
+            self.findings.append(Finding(
+                self.MODULE,
+                "SUSPICIOUS TCC PERMISSIONS GRANTED",
+                f"Found {len(suspicious_tcc)} non-Apple apps with Full Disk Access or Accessibility permissions",
+                severity=3, mitre_id="T1562",
+                evidence={"tcc_entries": suspicious_tcc},
+            ))
+
         return self.findings
-    
+
     def run_all(self) -> List[Finding]:
         os_type = get_os_type()
         if os_type == "windows":
@@ -1999,6 +2466,555 @@ class DefenseEvasionDetector:
             self.check_linux_defense_evasion()
         elif os_type == "macos":
             self.check_macos_defense_evasion()
+        return self.findings
+
+
+# ============================================================================
+# MODULE 5c: ROOTKIT DETECTOR
+# ============================================================================
+
+class RootkitDetector:
+    """Detect rootkits, hidden processes, unsigned drivers, and suspicious kernel modules."""
+
+    MODULE = "ROOTKIT_DETECTION"
+
+    def __init__(self, logger: logging.Logger):
+        self.logger = logger
+        self.findings: List[Finding] = []
+
+    def check_windows_rootkit(self) -> List[Finding]:
+        """Check for unsigned running drivers, test signing mode, and known rootkit driver names."""
+        self.logger.info("[ROOTKIT] Checking Windows for unsigned drivers and rootkit indicators...")
+        self.logger.info("  SEARCHING: Unsigned running drivers, test signing mode, known rootkit driver names")
+        self.logger.info("  WHY: Rootkits install kernel drivers to hide processes, files, and network connections.")
+
+        # --- Unsigned running drivers ---
+        out, _, rc = run_cmd(
+            'powershell -Command "Get-WmiObject Win32_SystemDriver | Where-Object {$_.State -eq \'Running\'} '
+            '| ForEach-Object { $sig = Get-AuthenticodeSignature $_.PathName -ErrorAction SilentlyContinue; '
+            'if ($sig.Status -ne \'Valid\') { [PSCustomObject]@{Name=$_.Name;Path=$_.PathName;Status=$sig.Status} } } '
+            '| ConvertTo-Json -Depth 2" 2>nul',
+            timeout=60
+        )
+        if rc == 0 and out and out.strip() not in ["", "null"]:
+            try:
+                unsigned = json.loads(out)
+                if isinstance(unsigned, dict):
+                    unsigned = [unsigned]
+                # Filter out known benign unsigned drivers
+                known_unsigned = ["", "null"]
+                real_unsigned = [d for d in unsigned if d.get("Name") and d["Name"].lower() not in known_unsigned]
+                if real_unsigned:
+                    self.findings.append(Finding(
+                        self.MODULE,
+                        "UNSIGNED KERNEL DRIVERS RUNNING",
+                        f"Found {len(real_unsigned)} running drivers without valid digital signatures - may indicate rootkit",
+                        severity=5, mitre_id="T1014",
+                        evidence={"unsigned_drivers": real_unsigned[:20]},
+                    ))
+            except json.JSONDecodeError:
+                pass
+
+        # --- Test signing mode ---
+        out, _, rc = run_cmd("bcdedit /enum 2>nul")
+        if rc == 0 and out:
+            if "testsigning" in out.lower() and "yes" in out.lower():
+                self.findings.append(Finding(
+                    self.MODULE,
+                    "WINDOWS TEST SIGNING MODE ENABLED",
+                    "Boot configuration has test signing enabled - allows loading unsigned kernel drivers",
+                    severity=5, mitre_id="T1014",
+                    evidence={"bcdedit_excerpt": out[:2000]},
+                ))
+
+        # --- Known rootkit driver names ---
+        known_rootkit_names = [
+            "fgexec", "odinaff", "pandora", "sauron", "wnbd", "winring0",
+            "capcom", "cpuz", "dbutil", "gdrv", "iqvw64e", "rtcore64",
+            "winpmem", "processhacker", "kprocesshacker", "mimikatz",
+        ]
+        out, _, rc = run_cmd(
+            'powershell -Command "Get-WmiObject Win32_SystemDriver | Where-Object {$_.State -eq \'Running\'} '
+            '| Select-Object Name,DisplayName,PathName | ConvertTo-Json -Depth 2" 2>nul',
+            timeout=30
+        )
+        if rc == 0 and out:
+            try:
+                drivers = json.loads(out)
+                if isinstance(drivers, dict):
+                    drivers = [drivers]
+                flagged = []
+                for drv in drivers:
+                    name = (drv.get("Name") or "").lower()
+                    if any(rk in name for rk in known_rootkit_names):
+                        flagged.append({
+                            "name": drv.get("Name", ""),
+                            "display_name": drv.get("DisplayName", ""),
+                            "path": drv.get("PathName", ""),
+                        })
+                if flagged:
+                    self.findings.append(Finding(
+                        self.MODULE,
+                        "KNOWN ROOTKIT/VULNERABLE DRIVER NAMES DETECTED",
+                        f"Found {len(flagged)} running drivers matching known rootkit/BYOVD names",
+                        severity=5, mitre_id="T1014",
+                        evidence={"flagged_drivers": flagged},
+                    ))
+            except json.JSONDecodeError:
+                pass
+
+        return self.findings
+
+    def check_linux_rootkit(self) -> List[Finding]:
+        """Check for hidden processes and kernel module discrepancies."""
+        self.logger.info("[ROOTKIT] Checking Linux for hidden processes and kernel anomalies...")
+        self.logger.info("  SEARCHING: Hidden processes (ps vs /proc), deleted binaries in /proc")
+        self.logger.info("  WHY: Rootkits hide malicious processes from ps and other userspace tools.")
+
+        # --- Hidden processes: compare ps PIDs vs /proc PIDs ---
+        ps_out, _, rc = run_cmd("ps -eo pid --no-headers 2>/dev/null")
+        if rc == 0 and ps_out:
+            ps_pids = set()
+            for line in ps_out.split("\n"):
+                line = line.strip()
+                if line.isdigit():
+                    ps_pids.add(int(line))
+
+            proc_pids = set()
+            for entry in os.listdir("/proc"):
+                if entry.isdigit():
+                    proc_pids.add(int(entry))
+
+            # PIDs in /proc but not in ps = hidden from ps
+            hidden = proc_pids - ps_pids
+            # Filter out kernel threads (they may not show in ps depending on flags)
+            real_hidden = []
+            for pid in hidden:
+                try:
+                    cmdline_path = f"/proc/{pid}/cmdline"
+                    if os.path.exists(cmdline_path):
+                        with open(cmdline_path, "r") as f:
+                            cmdline = f.read().strip()
+                            if cmdline:  # Has a cmdline = real process, not kthread
+                                exe_path = os.readlink(f"/proc/{pid}/exe") if os.path.exists(f"/proc/{pid}/exe") else ""
+                                real_hidden.append({
+                                    "pid": pid,
+                                    "cmdline": cmdline[:200],
+                                    "exe": exe_path,
+                                })
+                except (PermissionError, OSError):
+                    pass
+
+            if real_hidden:
+                self.findings.append(Finding(
+                    self.MODULE,
+                    "HIDDEN PROCESSES DETECTED",
+                    f"Found {len(real_hidden)} processes visible in /proc but hidden from ps - strong rootkit indicator",
+                    severity=5, mitre_id="T1014",
+                    evidence={"hidden_processes": real_hidden[:20]},
+                ))
+
+        # --- Check for deleted binaries still running ---
+        deleted_procs = []
+        for pid_dir in glob.glob("/proc/[0-9]*/exe"):
+            try:
+                exe_link = os.readlink(pid_dir)
+                if "(deleted)" in exe_link:
+                    pid = pid_dir.split("/")[2]
+                    deleted_procs.append({
+                        "pid": pid,
+                        "exe": exe_link,
+                    })
+            except (PermissionError, OSError):
+                pass
+        if deleted_procs:
+            self.findings.append(Finding(
+                self.MODULE,
+                "PROCESSES RUNNING FROM DELETED BINARIES",
+                f"Found {len(deleted_procs)} processes whose binary has been deleted from disk - potential malware",
+                severity=4, mitre_id="T1014",
+                evidence={"deleted_binary_processes": deleted_procs[:20]},
+            ))
+
+        return self.findings
+
+    def check_macos_rootkit(self) -> List[Finding]:
+        """Check for non-Apple kexts, suspicious system extensions, and tampered system binaries."""
+        self.logger.info("[ROOTKIT] Checking macOS for non-Apple kexts and tampered system binaries...")
+        self.logger.info("  SEARCHING: Third-party kexts, system extensions, code signing of key binaries")
+        self.logger.info("  WHY: Rootkits may install kernel extensions or replace system binaries.")
+
+        # --- Non-Apple kernel extensions ---
+        out, _, rc = run_cmd("kextstat 2>/dev/null")
+        if rc == 0 and out:
+            non_apple_kexts = []
+            for line in out.split("\n"):
+                line = line.strip()
+                if not line or line.startswith("Index") or line.startswith("---"):
+                    continue
+                # kextstat lines have bundle IDs; Apple ones start with com.apple.
+                parts = line.split()
+                for part in parts:
+                    if "." in part and not part.startswith("com.apple.") and not part[0].isdigit():
+                        non_apple_kexts.append({"kext_id": part, "raw_line": line[:200]})
+                        break
+            if non_apple_kexts:
+                self.findings.append(Finding(
+                    self.MODULE,
+                    "NON-APPLE KERNEL EXTENSIONS LOADED",
+                    f"Found {len(non_apple_kexts)} non-Apple kexts loaded - review for legitimacy",
+                    severity=3, mitre_id="T1014",
+                    evidence={"kexts": non_apple_kexts},
+                ))
+
+        # --- System extensions ---
+        out, _, rc = run_cmd("systemextensionsctl list 2>/dev/null")
+        if rc == 0 and out:
+            non_apple_ext = []
+            for line in out.split("\n"):
+                if line.strip() and "com.apple." not in line and "---" not in line and "enabled" in line.lower():
+                    non_apple_ext.append(line.strip())
+            if non_apple_ext:
+                self.findings.append(Finding(
+                    self.MODULE,
+                    "NON-APPLE SYSTEM EXTENSIONS",
+                    f"Found {len(non_apple_ext)} non-Apple system extensions",
+                    severity=3, mitre_id="T1014",
+                    evidence={"extensions": non_apple_ext},
+                ))
+
+        # --- Code signing verification of key binaries ---
+        critical_binaries = ["/usr/bin/login", "/usr/sbin/sshd", "/usr/bin/sudo", "/usr/bin/su",
+                             "/usr/bin/ssh", "/usr/libexec/security_authtrampoline"]
+        tampered = []
+        for binary in critical_binaries:
+            if os.path.exists(binary):
+                out, err, rc = run_cmd(f'codesign -v "{binary}" 2>&1')
+                combined = f"{out} {err}".lower()
+                if rc != 0 and "valid on disk" not in combined:
+                    tampered.append({
+                        "binary": binary,
+                        "codesign_output": f"{out} {err}"[:300],
+                    })
+        if tampered:
+            self.findings.append(Finding(
+                self.MODULE,
+                "TAMPERED SYSTEM BINARIES DETECTED",
+                f"Found {len(tampered)} critical system binaries with invalid code signatures",
+                severity=5, mitre_id="T1014",
+                evidence={"tampered_binaries": tampered},
+            ))
+
+        return self.findings
+
+    def run_all(self) -> List[Finding]:
+        os_type = get_os_type()
+        if os_type == "windows":
+            self.check_windows_rootkit()
+        elif os_type == "linux":
+            self.check_linux_rootkit()
+        elif os_type == "macos":
+            self.check_macos_rootkit()
+        return self.findings
+
+
+# ============================================================================
+# MODULE 5d: WEB SHELL DETECTOR
+# ============================================================================
+
+class WebShellDetector:
+    """Detect web shells in common web server directories."""
+
+    MODULE = "WEB_SHELL_DETECTION"
+
+    WEB_SHELL_PATTERNS = [
+        re.compile(rb"eval\s*\(", re.I),
+        re.compile(rb"exec\s*\(", re.I),
+        re.compile(rb"system\s*\(", re.I),
+        re.compile(rb"passthru\s*\(", re.I),
+        re.compile(rb"shell_exec\s*\(", re.I),
+        re.compile(rb"base64_decode\s*\(", re.I),
+        re.compile(rb"gzinflate\s*\(", re.I),
+        re.compile(rb"Runtime\.getRuntime\(\)\.exec", re.I),
+        re.compile(rb"WScript\.Shell", re.I),
+        re.compile(rb"cmd\.exe|/bin/sh|/bin/bash", re.I),
+        re.compile(rb"ProcessStartInfo|Process\.Start", re.I),
+        re.compile(rb"<%.*?%>.*?Request\[", re.I | re.S),
+    ]
+
+    WEB_EXTENSIONS = {".php", ".aspx", ".asp", ".jsp", ".py", ".cgi", ".cfm", ".jspx"}
+
+    def __init__(self, logger: logging.Logger):
+        self.logger = logger
+        self.findings: List[Finding] = []
+
+    def _get_web_roots(self) -> List[str]:
+        """Auto-discover web server document roots."""
+        os_type = get_os_type()
+        roots = []
+        if os_type == "windows":
+            candidates = [
+                "C:\\inetpub\\wwwroot", "C:\\xampp\\htdocs",
+                "C:\\wamp\\www", "C:\\wamp64\\www",
+                "D:\\inetpub\\wwwroot", "D:\\wwwroot",
+            ]
+        elif os_type == "macos":
+            candidates = [
+                "/Library/WebServer/Documents",
+                "/usr/local/var/www",
+                os.path.expanduser("~/Sites"),
+            ]
+        else:
+            candidates = [
+                "/var/www/html", "/var/www",
+                "/usr/share/nginx/html",
+                "/srv/www", "/srv/http",
+                "/opt/lampp/htdocs",
+            ]
+        for c in candidates:
+            if os.path.isdir(c):
+                roots.append(c)
+        return roots
+
+    def scan_web_roots(self) -> List[Finding]:
+        """Scan web roots for files matching web shell patterns."""
+        self.logger.info("[WEBSHELL] Scanning web roots for potential web shells...")
+        roots = self._get_web_roots()
+        if not roots:
+            self.logger.info("  No web server document roots found. Skipping.")
+            return self.findings
+
+        self.logger.info(f"  SEARCHING: {', '.join(roots)}")
+        self.logger.info("  WHY: Web shells provide persistent backdoor access via web-accessible files.")
+
+        suspicious_files = []
+        files_scanned = 0
+        max_files = 5000
+
+        for root in roots:
+            for dirpath, _, filenames in os.walk(root):
+                for fname in filenames:
+                    if files_scanned >= max_files:
+                        break
+                    ext = os.path.splitext(fname)[1].lower()
+                    if ext not in self.WEB_EXTENSIONS:
+                        continue
+                    fpath = os.path.join(dirpath, fname)
+                    files_scanned += 1
+                    try:
+                        with open(fpath, "rb") as f:
+                            content = f.read(65536)  # Read first 64KB
+                        match_count = sum(1 for pat in self.WEB_SHELL_PATTERNS if pat.search(content))
+                        if match_count >= 2:
+                            suspicious_files.append({
+                                "path": fpath,
+                                "pattern_matches": match_count,
+                                "size_bytes": os.path.getsize(fpath),
+                                "modified": datetime.fromtimestamp(
+                                    os.path.getmtime(fpath), tz=timezone.utc
+                                ).isoformat(),
+                            })
+                    except (PermissionError, OSError):
+                        pass
+                if files_scanned >= max_files:
+                    break
+
+        if suspicious_files:
+            self.findings.append(Finding(
+                self.MODULE,
+                "POTENTIAL WEB SHELLS DETECTED",
+                f"Found {len(suspicious_files)} files matching 2+ web shell patterns across {len(roots)} web root(s)",
+                severity=5, mitre_id="T1505.003",
+                evidence={"web_shells": suspicious_files[:30], "files_scanned": files_scanned},
+            ))
+        else:
+            self.logger.info(f"  Scanned {files_scanned} web files - no web shells detected.")
+
+        return self.findings
+
+    def run_all(self) -> List[Finding]:
+        self.scan_web_roots()
+        return self.findings
+
+
+# ============================================================================
+# MODULE 5e: CERTIFICATE TRUST STORE AUDITOR
+# ============================================================================
+
+class CertificateAuditor:
+    """Audit certificate trust stores for unauthorized or recently added certificates."""
+
+    MODULE = "CERTIFICATE_AUDIT"
+
+    def __init__(self, logger: logging.Logger):
+        self.logger = logger
+        self.findings: List[Finding] = []
+
+    def check_windows_certs(self) -> List[Finding]:
+        """Audit Windows certificate store for suspicious root CAs."""
+        self.logger.info("[CERTS] Auditing Windows root certificate store...")
+        self.logger.info("  SEARCHING: Self-signed or recently added root CAs in LocalMachine\\Root")
+        self.logger.info("  WHY: Attackers add rogue root CAs to intercept TLS traffic or sign malware.")
+
+        out, _, rc = run_cmd(
+            'powershell -Command "Get-ChildItem Cert:\\LocalMachine\\Root '
+            '| Select-Object Subject,Issuer,NotBefore,NotAfter,Thumbprint '
+            '| ConvertTo-Json -Depth 2" 2>nul',
+            timeout=20
+        )
+        if rc == 0 and out:
+            try:
+                certs = json.loads(out)
+                if isinstance(certs, dict):
+                    certs = [certs]
+                known_issuers = [
+                    "microsoft", "digicert", "verisign", "globalsign", "comodo",
+                    "entrust", "godaddy", "usertrust", "sectigo", "thawte",
+                    "geotrust", "starfield", "baltimore", "amazon", "isrg",
+                    "certum", "actalis", "buypass", "quovadis", "trustcor",
+                ]
+                suspicious_certs = []
+                thirty_days_ago = datetime.now(timezone.utc).timestamp() - (30 * 86400)
+                for cert in certs:
+                    subject = str(cert.get("Subject", "")).lower()
+                    issuer = str(cert.get("Issuer", "")).lower()
+                    # Self-signed: subject == issuer
+                    is_self_signed = subject == issuer
+                    is_known = any(ki in issuer for ki in known_issuers)
+                    # Check if recently added (NotBefore within 30 days)
+                    not_before_str = str(cert.get("NotBefore", ""))
+                    is_recent = False
+                    try:
+                        # PowerShell dates come in various formats
+                        if not_before_str:
+                            nb_ts = datetime.fromisoformat(not_before_str.replace("/Date(", "").replace(")/", "")).timestamp()
+                            is_recent = nb_ts > thirty_days_ago
+                    except (ValueError, TypeError, OSError):
+                        pass
+                    if (is_self_signed and not is_known) or (is_recent and not is_known):
+                        suspicious_certs.append({
+                            "subject": cert.get("Subject", ""),
+                            "issuer": cert.get("Issuer", ""),
+                            "thumbprint": cert.get("Thumbprint", ""),
+                            "not_before": not_before_str,
+                            "self_signed": is_self_signed,
+                            "recently_added": is_recent,
+                        })
+                if suspicious_certs:
+                    self.findings.append(Finding(
+                        self.MODULE,
+                        "SUSPICIOUS ROOT CERTIFICATES DETECTED",
+                        f"Found {len(suspicious_certs)} suspicious certificates in the root store",
+                        severity=4, mitre_id="T1553",
+                        evidence={"certificates": suspicious_certs[:20]},
+                    ))
+            except json.JSONDecodeError:
+                pass
+
+        return self.findings
+
+    def check_linux_certs(self) -> List[Finding]:
+        """Audit Linux certificate trust store for recently modified certs."""
+        self.logger.info("[CERTS] Auditing Linux certificate trust store...")
+        self.logger.info("  SEARCHING: Recently modified certificates in system CA directories")
+        self.logger.info("  WHY: Rogue CA certificates enable MITM attacks on TLS connections.")
+
+        cert_dirs = [
+            "/etc/ssl/certs",
+            "/usr/local/share/ca-certificates",
+            "/etc/pki/tls/certs",
+            "/etc/pki/ca-trust/source/anchors",
+        ]
+        thirty_days_ago = datetime.now(timezone.utc).timestamp() - (30 * 86400)
+        recent_certs = []
+
+        for cert_dir in cert_dirs:
+            if not os.path.isdir(cert_dir):
+                continue
+            try:
+                for fname in os.listdir(cert_dir):
+                    fpath = os.path.join(cert_dir, fname)
+                    if not os.path.isfile(fpath):
+                        continue
+                    try:
+                        mtime = os.path.getmtime(fpath)
+                        if mtime > thirty_days_ago:
+                            recent_certs.append({
+                                "path": fpath,
+                                "modified": datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat(),
+                                "size_bytes": os.path.getsize(fpath),
+                            })
+                    except OSError:
+                        pass
+            except (PermissionError, OSError):
+                pass
+
+        if recent_certs:
+            self.findings.append(Finding(
+                self.MODULE,
+                "RECENTLY MODIFIED CA CERTIFICATES",
+                f"Found {len(recent_certs)} certificates modified within the last 30 days",
+                severity=3, mitre_id="T1553",
+                evidence={"recent_certificates": recent_certs[:30]},
+            ))
+
+        return self.findings
+
+    def check_macos_certs(self) -> List[Finding]:
+        """Audit macOS System keychain for non-Apple trusted root certificates."""
+        self.logger.info("[CERTS] Auditing macOS System keychain for non-Apple root certificates...")
+        self.logger.info("  SEARCHING: Non-Apple trusted root certificates in System.keychain")
+        self.logger.info("  WHY: Rogue root CAs in the System keychain allow TLS interception.")
+
+        out, _, rc = run_cmd(
+            'security find-certificate -a -p /Library/Keychains/System.keychain 2>/dev/null',
+            timeout=20
+        )
+        if rc == 0 and out:
+            # Parse PEM certificates and check subjects
+            non_apple_certs = []
+            cert_blocks = out.split("-----END CERTIFICATE-----")
+            for block in cert_blocks:
+                block = block.strip()
+                if "-----BEGIN CERTIFICATE-----" not in block:
+                    continue
+                pem = block + "\n-----END CERTIFICATE-----"
+                # Use openssl to get subject
+                import tempfile
+                try:
+                    with tempfile.NamedTemporaryFile(mode="w", suffix=".pem", delete=False) as tmp:
+                        tmp.write(pem)
+                        tmp_path = tmp.name
+                    subj_out, _, rc2 = run_cmd(
+                        f'openssl x509 -in "{tmp_path}" -noout -subject -issuer 2>/dev/null'
+                    )
+                    os.unlink(tmp_path)
+                    if rc2 == 0 and subj_out:
+                        subj_lower = subj_out.lower()
+                        if "apple" not in subj_lower and "o = apple" not in subj_lower:
+                            non_apple_certs.append(subj_out.strip())
+                except OSError:
+                    pass
+
+            if non_apple_certs:
+                self.findings.append(Finding(
+                    self.MODULE,
+                    "NON-APPLE ROOT CERTIFICATES IN SYSTEM KEYCHAIN",
+                    f"Found {len(non_apple_certs)} non-Apple certificates in System.keychain",
+                    severity=3, mitre_id="T1553",
+                    evidence={"certificates": non_apple_certs[:30]},
+                ))
+
+        return self.findings
+
+    def run_all(self) -> List[Finding]:
+        os_type = get_os_type()
+        if os_type == "windows":
+            self.check_windows_certs()
+        elif os_type == "linux":
+            self.check_linux_certs()
+        elif os_type == "macos":
+            self.check_macos_certs()
         return self.findings
 
 
@@ -3258,13 +4274,17 @@ class NovaConfidenceScorer:
         "exfil_rclone_mega": 5,
         "lateral_rdp_psexec": 5,
         "evtx_nova_commands": 10,
+        "rootkit_detected": 15,
+        "web_shell_detected": 10,
+        "certificate_tampering": 5,
+        "persistence_advanced": 5,
     }
-    # Max possible: 135
+    # Max possible: 170
     # Thresholds:
-    #   >= 60: CONFIRMED Nova
-    #   40-59: HIGHLY LIKELY Nova
-    #   20-39: POSSIBLE Nova (needs investigation)
-    #   < 20:  INSUFFICIENT EVIDENCE
+    #   >= 70: CONFIRMED Nova
+    #   50-69: HIGHLY LIKELY Nova
+    #   25-49: POSSIBLE Nova (needs investigation)
+    #   < 25:  INSUFFICIENT EVIDENCE
 
     TITLE_PATTERNS = {
         "hash_match": [
@@ -3314,6 +4334,30 @@ class NovaConfidenceScorer:
             re.compile(r"NOVA.*SYSMON", re.I),
             re.compile(r"EVTX.*NOVA", re.I),
             re.compile(r"NOVA.*EVTX", re.I),
+        ],
+        "rootkit_detected": [
+            re.compile(r"ROOTKIT", re.I),
+            re.compile(r"HIDDEN PROCESS", re.I),
+            re.compile(r"UNSIGNED.*DRIVER", re.I),
+            re.compile(r"KERNEL MODULE DISCREPANC", re.I),
+            re.compile(r"TEST SIGNING MODE", re.I),
+        ],
+        "web_shell_detected": [
+            re.compile(r"WEB SHELL", re.I),
+        ],
+        "certificate_tampering": [
+            re.compile(r"SUSPICIOUS ROOT CERT", re.I),
+            re.compile(r"RECENTLY MODIFIED CA", re.I),
+            re.compile(r"NON-APPLE ROOT CERT", re.I),
+        ],
+        "persistence_advanced": [
+            re.compile(r"IFEO.*HIJACK", re.I),
+            re.compile(r"COM OBJECT HIJACK", re.I),
+            re.compile(r"APPINIT_DLLS", re.I),
+            re.compile(r"ACCESSIBILITY.*BACKDOOR", re.I),
+            re.compile(r"LD_PRELOAD", re.I),
+            re.compile(r"PRINT MONITOR", re.I),
+            re.compile(r"LSA PACKAGE", re.I),
         ],
     }
 
@@ -3367,11 +4411,11 @@ class NovaConfidenceScorer:
                 }
 
         # Determine confidence level
-        if score >= 60:
+        if score >= 70:
             confidence_level = "CONFIRMED NOVA"
-        elif score >= 40:
+        elif score >= 50:
             confidence_level = "HIGHLY LIKELY NOVA"
-        elif score >= 20:
+        elif score >= 25:
             confidence_level = "POSSIBLE NOVA"
         else:
             confidence_level = "INSUFFICIENT EVIDENCE"
@@ -3396,7 +4440,7 @@ class NovaConfidenceScorer:
             )
 
         r = self.result
-        sev = 5 if r["score"] >= 60 else 4 if r["score"] >= 40 else 3 if r["score"] >= 20 else 1
+        sev = 5 if r["score"] >= 70 else 4 if r["score"] >= 50 else 3 if r["score"] >= 25 else 1
         return Finding(
             self.MODULE,
             f"NOVA ATTRIBUTION: {r['confidence_level']}",
@@ -3498,7 +4542,7 @@ class ReportGenerator:
         data = {
             "metadata": {
                 "tool": "Nova/RALord IR Toolkit",
-                "version": "2.0",
+                "version": "2.1",
                 "generated_at": datetime.now(timezone.utc).isoformat(),
                 "hostname": self.os_info.get("hostname", socket.gethostname()),
                 "os_type": self.os_info.get("os_type", ""),
@@ -3507,6 +4551,7 @@ class ReportGenerator:
                 "os_architecture": self.os_info.get("architecture", ""),
                 "os_kernel": self.os_info.get("kernel", ""),
                 "os_platform": self.os_info.get("platform", platform.platform()),
+                "operational_mode": self.os_info.get("operational_mode", "LIVE"),
                 "threat_group": "Nova RaaS (formerly RALord)",
             },
             "executive_summary": self._exec_summary(),
@@ -3541,6 +4586,7 @@ class ReportGenerator:
     def generate_txt(self):
         path = os.path.join(self.output_dir, "nova_ir_report.txt")
         with open(path, "w") as f:
+            op_mode = self.os_info.get("operational_mode", "LIVE")
             f.write("=" * 80 + "\n")
             f.write(" NOVA (RALord) RANSOMWARE - INCIDENT RESPONSE REPORT\n")
             f.write(f" Generated: {datetime.now(timezone.utc).isoformat()}\n")
@@ -3549,7 +4595,12 @@ class ReportGenerator:
             f.write(f" Arch:      {self.os_info.get('architecture', '')}\n")
             if self.os_info.get("kernel"):
                 f.write(f" Kernel:    {self.os_info['kernel']}\n")
-            f.write("=" * 80 + "\n\n")
+            f.write(f" Mode:      {op_mode} ANALYSIS\n")
+            f.write("=" * 80 + "\n")
+            if op_mode == "OFFLINE":
+                f.write(" NOTE: This report is based on offline EVTX analysis only.\n")
+                f.write("       No live system checks were performed.\n")
+            f.write("\n")
             
             summary = self._exec_summary()
             f.write("EXECUTIVE SUMMARY\n")
@@ -3659,9 +4710,9 @@ class ReportGenerator:
 MITRE_TACTICS = {
     "TA0001": {"name": "Initial Access", "techniques": ["T1078", "T1133", "T1566", "T1204"]},
     "TA0002": {"name": "Execution", "techniques": ["T1059", "T1106"]},
-    "TA0003": {"name": "Persistence", "techniques": ["T1053", "T1543", "T1546", "T1547", "T1574", "T1197"]},
+    "TA0003": {"name": "Persistence", "techniques": ["T1053", "T1543", "T1546", "T1547", "T1574", "T1197", "T1505.003", "T1546.008", "T1546.012", "T1546.015", "T1547.002", "T1547.010", "T1574.001"]},
     "TA0004": {"name": "Privilege Escalation", "techniques": ["T1068", "T1055"]},
-    "TA0005": {"name": "Defense Evasion", "techniques": ["T1027", "T1070", "T1112", "T1497", "T1562"]},
+    "TA0005": {"name": "Defense Evasion", "techniques": ["T1027", "T1070", "T1112", "T1497", "T1562", "T1014", "T1553", "T1564"]},
     "TA0006": {"name": "Credential Access", "techniques": ["T1003", "T1110", "T1550"]},
     "TA0007": {"name": "Discovery", "techniques": ["T1012", "T1018", "T1082", "T1083"]},
     "TA0008": {"name": "Lateral Movement", "techniques": ["T1021", "T1570"]},
@@ -3694,6 +4745,11 @@ TECHNIQUE_NAMES = {
     "T1486": "Data Encrypted for Impact", "T1490": "Inhibit System Recovery",
     "T1491": "Defacement",
     "T1098": "Account Manipulation", "T1136": "Create Account",
+    "T1014": "Rootkit", "T1505.003": "Web Shell",
+    "T1553": "Subvert Trust Controls", "T1564": "Hide Artifacts",
+    "T1546.008": "Accessibility Features", "T1546.012": "Image File Execution Options Injection",
+    "T1546.015": "Component Object Model Hijacking", "T1547.010": "Port Monitors",
+    "T1547.002": "Authentication Package", "T1574.001": "DLL Search Order Hijacking",
 }
 
 
@@ -3763,13 +4819,14 @@ class MITREReportGenerator:
         data = {
             "metadata": {
                 "tool": "Nova/RALord IR Toolkit - MITRE ATT&CK Report",
-                "version": "2.0",
+                "version": "2.1",
                 "generated_at": datetime.now(timezone.utc).isoformat(),
                 "hostname": self.os_info.get("hostname", socket.gethostname()),
                 "os_type": self.os_info.get("os_type", ""),
                 "os_distribution": self.os_info.get("distribution", ""),
                 "os_architecture": self.os_info.get("architecture", ""),
                 "os_platform": self.os_info.get("platform", platform.platform()),
+                "operational_mode": self.os_info.get("operational_mode", "LIVE"),
             },
             "attribution": self.confidence_result,
             "coverage_summary": {
@@ -3794,6 +4851,7 @@ class MITREReportGenerator:
         observed_techniques = sum(t["techniques_observed"] for t in tactics_data)
 
         with open(path, "w") as f:
+            mitre_op_mode = self.os_info.get("operational_mode", "LIVE")
             f.write("=" * 80 + "\n")
             f.write(" NOVA/RALord RANSOMWARE - MITRE ATT&CK ANALYSIS REPORT\n")
             f.write(f" Generated: {datetime.now(timezone.utc).isoformat()}\n")
@@ -3802,7 +4860,11 @@ class MITREReportGenerator:
             f.write(f" Arch:      {self.os_info.get('architecture', '')}\n")
             if self.os_info.get("kernel"):
                 f.write(f" Kernel:    {self.os_info['kernel']}\n")
-            f.write("=" * 80 + "\n\n")
+            f.write(f" Mode:      {mitre_op_mode} ANALYSIS\n")
+            f.write("=" * 80 + "\n")
+            if mitre_op_mode == "OFFLINE":
+                f.write(" NOTE: This report is based on offline EVTX analysis only.\n")
+            f.write("\n")
 
             # Section 1: Nova Attribution Assessment
             f.write("=" * 80 + "\n")
@@ -3996,36 +5058,54 @@ class MITREReportGenerator:
 
 def main():
     banner = r"""
-    ╔══════════════════════════════════════════════════════════════════╗
-    ║       NOVA / RALord RANSOMWARE - IR & THREAT HUNTING TOOLKIT   ║
-    ║                                                                ║
-    ║  Modules: IOC Scanner | Persistence | Lateral Movement         ║
-    ║           Exfiltration | Defense Evasion | Credential Artifacts ║
-    ║           Live Triage | EVTX Analyzer | Timeline Builder        ║
-    ║           Nova Confidence Scorer | MITRE ATT&CK Report          ║
-    ║                                                                ║
-    ║  ⚠  RUN AS ADMINISTRATOR / ROOT FOR FULL VISIBILITY  ⚠        ║
-    ╚══════════════════════════════════════════════════════════════════╝
+    ╔══════════════════════════════════════════════════════════════════════╗
+    ║       NOVA / RALord RANSOMWARE - IR & THREAT HUNTING TOOLKIT v2.1  ║
+    ║                                                                    ║
+    ║  Modules: IOC Scanner | Persistence | Lateral Movement             ║
+    ║           Exfiltration | Defense Evasion | Credential Artifacts     ║
+    ║           Live Triage | EVTX Analyzer | Rootkit Detector            ║
+    ║           Web Shell Detector | Certificate Auditor                  ║
+    ║           Nova Confidence Scorer | MITRE ATT&CK Report             ║
+    ║                                                                    ║
+    ║  Modes:  LIVE  = Full system analysis (all modules)                ║
+    ║          OFFLINE = EVTX-only analysis (no live system checks)      ║
+    ║                                                                    ║
+    ║  ⚠  RUN AS ADMINISTRATOR / ROOT FOR FULL VISIBILITY  ⚠            ║
+    ╚══════════════════════════════════════════════════════════════════════╝
     """
     print(banner)
 
     parser = argparse.ArgumentParser(description="Nova/RALord Ransomware IR Toolkit")
     parser.add_argument("--output-dir", "-o", default=None,
                         help="Output directory for reports")
-    parser.add_argument("--modules", "-m", default="all",
-                        help="Comma-separated modules: ioc,persistence,lateral,exfil,evasion,creds,triage,evtx (or 'all')")
+    parser.add_argument("--modules", "-m", default=None,
+                        help="Comma-separated modules: ioc,persistence,lateral,exfil,evasion,creds,triage,evtx,rootkit,webshell,certs (or 'all')")
     parser.add_argument("--quick", "-q", action="store_true",
                         help="Quick triage mode (IOC + Triage only)")
     parser.add_argument("--evtx", nargs="+", default=None,
                         help="Path(s) to .evtx file(s) or directory containing .evtx files for offline analysis")
+    parser.add_argument("--offline", action="store_true",
+                        help="Explicit offline mode: only analyze provided EVTX files, no live system checks")
     args = parser.parse_args()
+
+    # ---- Determine operational mode ----
+    # OFFLINE: --evtx provided without --modules (or with --offline flag)
+    # LIVE: --modules specified, or no --evtx at all
+    if args.offline:
+        operational_mode = "OFFLINE"
+    elif args.evtx and args.modules is None and not args.quick:
+        # --evtx alone without --modules = auto OFFLINE
+        operational_mode = "OFFLINE"
+    else:
+        operational_mode = "LIVE"
 
     # Setup output directory
     if args.output_dir:
         output_dir = args.output_dir
     else:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_dir = os.path.join(os.path.expanduser("~"), f"nova_ir_{ts}")
+        mode_tag = "offline" if operational_mode == "OFFLINE" else "live"
+        output_dir = os.path.join(os.path.expanduser("~"), f"nova_ir_{mode_tag}_{ts}")
 
     os.makedirs(output_dir, exist_ok=True)
     logger = setup_logging(output_dir)
@@ -4037,6 +5117,23 @@ def main():
     # ---- OS Detection ----
     os_info = get_os_info()
     os_type = os_info["os_type"]
+    os_info["operational_mode"] = operational_mode
+
+    # ---- Mode Banner ----
+    if operational_mode == "OFFLINE":
+        print("  " + "=" * 60)
+        print("  RUNNING IN OFFLINE EVTX ANALYSIS MODE")
+        print("  Only EVTX event log analysis will be performed.")
+        print("  No live system checks will run.")
+        print("  " + "=" * 60)
+    else:
+        print("  " + "=" * 60)
+        print("  RUNNING IN LIVE SYSTEM ANALYSIS MODE")
+        print("  Full system forensic analysis will be performed.")
+        if args.evtx:
+            print("  EVTX offline analysis is also included.")
+        print("  " + "=" * 60)
+    print()
 
     print(f"  [*] Detected OS:     {os_info['distribution']}")
     print(f"  [*] Architecture:    {os_info['architecture']}")
@@ -4045,27 +5142,41 @@ def main():
         print(f"  [*] Kernel:          {os_info['kernel']}")
     if os_info["version"]:
         print(f"  [*] Version:         {os_info['version']}")
+    print(f"  [*] Mode:            {operational_mode}")
     print()
 
     logger.info(f"Nova IR Toolkit started on {os_info['hostname']}")
+    logger.info(f"Operational mode: {operational_mode}")
     logger.info(f"Detected OS: {os_info['distribution']} ({os_info['architecture']})")
     logger.info(f"Platform: {os_info['platform']}")
     if os_info["kernel"]:
         logger.info(f"Kernel: {os_info['kernel']}")
     logger.info(f"Output directory: {output_dir}")
 
-    # Determine modules to run
-    if args.quick:
+    # ---- Determine modules to run ----
+    if operational_mode == "OFFLINE":
+        modules = {"evtx"}
+        if not args.evtx:
+            logger.error("OFFLINE mode requires --evtx paths. Use: --offline --evtx /path/to/logs/")
+            print("  ERROR: OFFLINE mode requires --evtx paths.")
+            print("  Usage: python3 nova_ir_toolkit.py --offline --evtx /path/to/logs/")
+            return 1
+    elif args.quick:
         modules = {"ioc", "triage"}
-    elif args.modules == "all":
-        modules = {"ioc", "persistence", "lateral", "exfil", "evasion", "creds", "triage"}
+    elif args.modules and args.modules.lower() == "all":
+        modules = {"ioc", "persistence", "lateral", "exfil", "evasion", "creds",
+                    "triage", "rootkit", "webshell", "certs"}
         if args.evtx:
             modules.add("evtx")
-    else:
+    elif args.modules:
         modules = set(args.modules.lower().split(","))
+    else:
+        # Default: all live modules
+        modules = {"ioc", "persistence", "lateral", "exfil", "evasion", "creds",
+                    "triage", "rootkit", "webshell", "certs"}
 
-    # Auto-enable evtx module if --evtx paths provided
-    if args.evtx:
+    # Auto-enable evtx module if --evtx paths provided in LIVE mode
+    if args.evtx and operational_mode == "LIVE":
         modules.add("evtx")
 
     # ---- Display module applicability for this OS ----
@@ -4108,7 +5219,7 @@ def main():
 
     if "evasion" in modules:
         logger.info("=" * 60)
-        logger.info(f"MODULE 5: DEFENSE EVASION DETECTOR [{os_type.upper()}]")
+        logger.info(f"MODULE 5a: DEFENSE EVASION DETECTOR [{os_type.upper()}]")
         logger.info("=" * 60)
         evasion = DefenseEvasionDetector(logger)
         all_findings.extend(evasion.run_all())
@@ -4119,6 +5230,27 @@ def main():
         logger.info("=" * 60)
         creds = CredentialArtifactHunter(logger)
         all_findings.extend(creds.run_all())
+
+    if "rootkit" in modules:
+        logger.info("=" * 60)
+        logger.info(f"MODULE 5c: ROOTKIT DETECTOR [{os_type.upper()}]")
+        logger.info("=" * 60)
+        rootkit = RootkitDetector(logger)
+        all_findings.extend(rootkit.run_all())
+
+    if "webshell" in modules:
+        logger.info("=" * 60)
+        logger.info(f"MODULE 5d: WEB SHELL DETECTOR [{os_type.upper()}]")
+        logger.info("=" * 60)
+        webshell = WebShellDetector(logger)
+        all_findings.extend(webshell.run_all())
+
+    if "certs" in modules:
+        logger.info("=" * 60)
+        logger.info(f"MODULE 5e: CERTIFICATE AUDITOR [{os_type.upper()}]")
+        logger.info("=" * 60)
+        certaudit = CertificateAuditor(logger)
+        all_findings.extend(certaudit.run_all())
 
     if "triage" in modules:
         logger.info("=" * 60)
@@ -4174,15 +5306,18 @@ def main():
     high = sum(1 for f in all_findings if f.severity == 4)
 
     print("\n" + "=" * 60)
+    print(f"  MODE: {operational_mode} ANALYSIS")
     print(f"  SCAN COMPLETE - {len(all_findings)} findings")
     print(f"  CRITICAL: {critical} | HIGH: {high}")
     print(f"  NOVA ATTRIBUTION: {confidence_result['confidence_level']}")
     print(f"  Reports saved to: {output_dir}")
+    if operational_mode == "OFFLINE":
+        print("  NOTE: This report is based on offline EVTX analysis only.")
     print("=" * 60)
 
     if critical > 0:
-        print("\n  ⚠️  CRITICAL FINDINGS DETECTED - IMMEDIATE ACTION REQUIRED")
-        print("  ⚠️  Isolate this host and escalate to your IR team NOW\n")
+        print("\n  CRITICAL FINDINGS DETECTED - IMMEDIATE ACTION REQUIRED")
+        print("  Isolate this host and escalate to your IR team NOW\n")
 
     return 0 if critical == 0 else 1
 
